@@ -1,0 +1,81 @@
+[gd_scene format=3 uid="uid://camsq1y5dhqv4"]
+
+[ext_resource type="Script" uid="uid://byldmnxbl0lr8" path="res://main_menu.gd" id="1_menu"]
+[ext_resource type="Texture2D" uid="uid://c4g0pyla7kbf4" path="res://Assets/Title.png" id="2_7vrkn"]
+[ext_resource type="Shader" uid="uid://blejbf7o4wf0p" path="res://menu_background.gdshader" id="3_bgshader"]
+[ext_resource type="Texture2D" uid="uid://dmd52wbgbm5kq" path="res://Assets/Play.png" id="4_play"]
+
+[sub_resource type="ShaderMaterial" id="ShaderMaterial_bg"]
+shader = ExtResource("3_bgshader")
+shader_parameter/primary_color = Color(0.392, 0.541, 0.616, 1)
+shader_parameter/background_color = Color(0.129, 0.18, 0.208, 1)
+shader_parameter/accent_color = Color(0.588, 0.635, 0.659, 0.25)
+shader_parameter/pixel_size = 100.0
+shader_parameter/chrome_aberration = 0.02
+shader_parameter/noise_strength = 0.06
+shader_parameter/scanline_strength = 0.4
+shader_parameter/vignette_intensity = 1.4
+shader_parameter/wave_speed = 1.4
+shader_parameter/swirl_strength = 4.5
+shader_parameter/swirl_speed = 1.0
+
+[node name="MainMenu" type="Control" unique_id=1861474867]
+layout_mode = 3
+anchors_preset = 15
+anchor_right = 1.0
+anchor_bottom = 1.0
+grow_horizontal = 2
+grow_vertical = 2
+script = ExtResource("1_menu")
+
+[node name="ShaderBG" type="ColorRect" parent="." unique_id=1421816881]
+material = SubResource("ShaderMaterial_bg")
+layout_mode = 1
+anchors_preset = 15
+anchor_right = 1.0
+anchor_bottom = 1.0
+grow_horizontal = 2
+grow_vertical = 2
+color = Color(0.129412, 0.180392, 0.207843, 1)
+
+[node name="CenterContainer" type="CenterContainer" parent="." unique_id=1170734149]
+layout_mode = 1
+anchors_preset = 15
+anchor_right = 1.0
+anchor_bottom = 1.0
+grow_horizontal = 2
+grow_vertical = 2
+
+[node name="MenuBox" type="VBoxContainer" parent="CenterContainer" unique_id=909988042]
+layout_mode = 2
+theme_override_constants/separation = 22
+alignment = 1
+
+[node name="TopSpacer" type="Control" parent="CenterContainer/MenuBox" unique_id=476123890]
+custom_minimum_size = Vector2(0, 142)
+layout_mode = 2
+
+[node name="Title" type="TextureRect" parent="CenterContainer/MenuBox" unique_id=68982042]
+texture_filter = 3
+custom_minimum_size = Vector2(600, 91)
+layout_mode = 2
+size_flags_horizontal = 4
+texture = ExtResource("2_7vrkn")
+
+[node name="PlayButton" type="Button" parent="CenterContainer/MenuBox" unique_id=515748002]
+custom_minimum_size = Vector2(300, 84)
+layout_mode = 2
+size_flags_horizontal = 4
+
+[node name="PlayIcon" type="TextureRect" parent="CenterContainer/MenuBox/PlayButton" unique_id=271828183]
+texture_filter = 1
+layout_mode = 1
+anchors_preset = 15
+anchor_right = 1.0
+anchor_bottom = 1.0
+grow_horizontal = 2
+grow_vertical = 2
+mouse_filter = 2
+texture = ExtResource("4_play")
+expand_mode = 1
+stretch_mode = 5

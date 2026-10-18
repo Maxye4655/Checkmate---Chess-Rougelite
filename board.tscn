@@ -1,0 +1,21 @@
+[gd_scene format=3 uid="uid://374lf7cnhmmd"]
+
+[ext_resource type="Script" uid="uid://b3rbskbt88v2k" path="res://board.gd" id="1_board"]
+[ext_resource type="Shader" uid="uid://r1xq0lfh5iqc" path="res://board_background.gdshader" id="2_bgshader"]
+
+[sub_resource type="ShaderMaterial" id="ShaderMaterial_bg"]
+shader = ExtResource("2_bgshader")
+shader_parameter/color_top = Color(0.129, 0.18, 0.208, 1)
+shader_parameter/color_bottom = Color(0.07, 0.1, 0.12, 1)
+shader_parameter/scanline_opacity = 0.12
+shader_parameter/vignette_intensity = 1.1
+
+[node name="Board" type="Node2D" unique_id=1941079686]
+script = ExtResource("1_board")
+
+[node name="ShaderBG" type="ColorRect" parent="." unique_id=544710584]
+show_behind_parent = true
+material = SubResource("ShaderMaterial_bg")
+offset_right = 1152.0
+offset_bottom = 648.0
+color = Color(0.129412, 0.180392, 0.207843, 1)

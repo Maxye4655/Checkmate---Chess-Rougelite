@@ -1,0 +1,13 @@
+# Godot-specific imports and local cache
+.godot/
+
+# Exported build output
+*.apk
+*.aab
+*.exe
+*.zip
+*.tar.gz
+
+# System / OS temp files
+.DS_Store
+Thumbs.db
