@@ -1,5 +1,6 @@
 extends Node2D
-## Single-player chess board: rendering, input, animations and game-over flow.
+## Single-player chess "run": board rendering, input, animations, and the
+## win / lose / shop loop. Run-wide data lives in RunState, the shop in ShopScreen.
 
 # --- Scenes & layout ---------------------------------------------------------
 const MAIN_MENU_SCENE_PATH := "res://main_menu.tscn"
@@ -10,6 +11,12 @@ const BOARD_RIGHT_MARGIN: int = 48
 const FRAME_PADDING: float = 14.0
 const HUD_MARGIN := Vector2(40, 48)
 const TITLE_WIDTH := 207.0
+
+# --- Assets ------------------------------------------------------------------
+const FONT_PATH := "res://Assets/CheckMate.ttf"
+const TITLE_PATH := "res://Assets/Title.png"
+const COIN_PATH := "res://Assets/UI/coin.png"                  # optional (16x16)
+const CRACKED_KING_PATH := "res://Assets/W_King_Cracked.png"   # optional, same size as W_King.png
 
 # --- Pieces ------------------------------------------------------------------
 const PIECE_SCALE := 0.99072        # 0.86 * 1.2 * 1.2 * 0.8
@@ -37,6 +44,7 @@ const BG := Color("212e35ff")
 const TEXT := Color("ffffffff")
 const TEXT_DIM := Color("96a2a8ff")
 const ACCENT := Color("648a9dff")
+const GOLD := Color("f2c14e")
 const OVERLAY_DIM := Color(0.129, 0.18, 0.208, 0.82)
 
 # --- Timings (seconds) -------------------------------------------------------
@@ -45,8 +53,16 @@ const CLICK_ANIM_TIME := 0.22
 const RESET_ANIM_TIME := 0.45
 const AI_THINK_DELAY := 0.2
 const MENU_FADE_TIME := 0.35
+const TOAST_TIME := 2.2
+
+# --- Defeat sequence ---------------------------------------------------------
+const DEFEAT_SHAKE_TIME := 0.55
+const DEFEAT_SHAKE_STRENGTH := 14.0
+const DEFEAT_MENU_DELAY := 0.75
 const LOSE_COUNTDOWN := 10.0
 const LOSE_WARNING_TIME := 3.0
+const FALLING_PIECE_COUNT := 16
+const SECOND_WIND_PLIES := 4
 
 const FILES := "abcdefgh"
 
@@ -74,21 +90,28 @@ class Anim:
 # --- Core objects ------------------------------------------------------------
 var engine: ChessEngine
 var ai: ChessAI
+var run: RunState
 var font: Font
 var piece_textures := {}
 var title_texture: Texture2D
+var coin_texture: Texture2D
 
 var _frame_style: StyleBoxFlat
 var _title_size := Vector2.ZERO
 
-# --- Game state --------------------------------------------------------------
+# --- Round state -------------------------------------------------------------
 var selected := Vector2i(-1, -1)
 var legal_for_selected: Array = []
 var hover := Vector2i(-1, -1)
 var _status: int = 0
 var _leaving := false
 var _ai_thinking := false
-var _ai_generation := 0          # bumped on reset so stale AI turns are discarded
+var _round_token := 0               # bumped each round so stale async work is discarded
+var _round_enemy_material := 0
+var _round_settled := false
+var _last_reward: Dictionary = {}
+var _toast_text := ""
+var _toast_timer := 0.0
 
 # --- Animations --------------------------------------------------------------
 var _move_anim := Anim.new()
@@ -98,13 +121,18 @@ var _move_code := 0
 var _click_anim := Anim.new()
 var _click_square := Vector2i(-1, -1)
 var _reset_anim := Anim.new()
+var _shake_anim := Anim.new()
 
-# --- Game-over UI ------------------------------------------------------------
+# --- Game-over / shop UI -----------------------------------------------------
+var _shop: ShopScreen = null
 var _game_over_layer: CanvasLayer = null
+var _defeat_pending := false
 var _lose_timer := 0.0
+var _last_tick := 0
+var _beat_phase := 0.0
+var _crack_applied := false
 var _heart_piece: TextureRect = null
 var _timer_label: Label = null
-var _heart_tween: Tween = null
 var _fade_overlay: ColorRect = null
 
 
@@ -115,8 +143,10 @@ var _fade_overlay: ColorRect = null
 func _ready() -> void:
 	engine = ChessEngine.new()
 	ai = ChessAI.new()
-	font = load("res://Assets/CheckMate.ttf")
-	title_texture = load("res://Assets/Title.png")
+	run = RunState.new()
+	font = load(FONT_PATH)
+	title_texture = load(TITLE_PATH)
+	coin_texture = _load_optional(COIN_PATH)
 	texture_filter = CanvasItem.TEXTURE_FILTER_NEAREST
 
 	for t in range(1, 7):
@@ -129,9 +159,11 @@ func _ready() -> void:
 	_frame_style.shadow_size = 18
 	_frame_style.shadow_offset = Vector2(0, 6)
 
-	_refresh_status()
-	queue_redraw()
-	_maybe_ai_move()
+	_start_round()
+
+
+func _load_optional(path: String) -> Texture2D:
+	return load(path) as Texture2D if ResourceLoader.exists(path) else null
 
 
 func _load_piece_texture(code: int) -> Texture2D:
@@ -196,6 +228,12 @@ func _refresh_status() -> void:
 
 func _is_game_over() -> bool:
 	return _status == ChessEngine.Status.CHECKMATE or _status == ChessEngine.Status.STALEMATE
+
+
+func _toast(message: String) -> void:
+	_toast_text = message
+	_toast_timer = TOAST_TIME
+	queue_redraw()
 
 
 # =============================================================================
@@ -315,9 +353,36 @@ func _draw_hud() -> void:
 	var mode_label := "Single Player  (You are %s)" % _color_name(GameConfig.player_color)
 	draw_string(font, Vector2(x, y), mode_label, HORIZONTAL_ALIGNMENT_LEFT, -1, 18, TEXT_DIM)
 	draw_string(font, Vector2(x, y + 38), _status_line(), HORIZONTAL_ALIGNMENT_LEFT, -1, 30, ACCENT)
+	_draw_run_info(x, y + 92.0)
 
-	var hint := "R  New game        Z  Undo        Esc  Menu"
+	if _toast_timer > 0.0:
+		var color := Color(GOLD, clampf(_toast_timer, 0.0, 1.0))
+		draw_string(font, Vector2(x, BASE_RESOLUTION.y - 64), _toast_text, HORIZONTAL_ALIGNMENT_LEFT, -1, 20, color)
+
+	var hint := "R  New run        Z  Undo        Esc  Menu"
 	draw_string(font, Vector2(x, BASE_RESOLUTION.y - 28), hint, HORIZONTAL_ALIGNMENT_LEFT, -1, 16, TEXT_DIM)
+
+
+func _draw_run_info(x: float, y: float) -> void:
+	draw_string(font, Vector2(x, y), "Round %d" % run.round_number, HORIZONTAL_ALIGNMENT_LEFT, -1, 20, TEXT)
+	y += 40.0
+
+	var coin_pos := Vector2(x, y - 26.0)
+	if coin_texture:
+		draw_texture_rect(coin_texture, Rect2(coin_pos, Vector2(32, 32)), false)
+	else:
+		draw_circle(coin_pos + Vector2(16, 16), 13.0, GOLD)
+		draw_arc(coin_pos + Vector2(16, 16), 13.0, 0.0, TAU, 24, GOLD.darkened(0.4), 2.0, true)
+	draw_string(font, Vector2(x + 42.0, y), str(run.coins), HORIZONTAL_ALIGNMENT_LEFT, -1, 26, GOLD)
+	y += 32.0
+
+	draw_string(font, Vector2(x, y), "Undos  %d" % run.undos_left, HORIZONTAL_ALIGNMENT_LEFT, -1, 18, TEXT_DIM)
+	y += 26.0
+	if run.extra_lives > 0:
+		draw_string(font, Vector2(x, y), "Second Winds  %d" % run.extra_lives, HORIZONTAL_ALIGNMENT_LEFT, -1, 18, TEXT_DIM)
+		y += 26.0
+	if run.enemy_queens > 0:
+		draw_string(font, Vector2(x, y), "Enemy Queens  %d" % run.enemy_queens, HORIZONTAL_ALIGNMENT_LEFT, -1, 18, MOVE_CAPTURE)
 
 
 func _status_line() -> String:
@@ -344,6 +409,18 @@ func _process(delta: float) -> void:
 		if anim.is_active():
 			anim.step(delta)
 			animating = true
+
+	if _toast_timer > 0.0:
+		_toast_timer = maxf(_toast_timer - delta, 0.0)
+		animating = true
+
+	if _shake_anim.is_active():
+		_shake_anim.step(delta)
+		var falloff := 1.0 - _shake_anim.t
+		position = Vector2(randf_range(-1.0, 1.0), randf_range(-1.0, 1.0)) * DEFEAT_SHAKE_STRENGTH * falloff
+		if not _shake_anim.is_active():
+			position = Vector2.ZERO
+
 	if animating:
 		queue_redraw()
 
@@ -354,42 +431,74 @@ func _update_lose_countdown(delta: float) -> void:
 	if _lose_timer <= 0.0:
 		return
 	_lose_timer -= delta
+	var progress := 1.0 - clampf(_lose_timer / LOSE_COUNTDOWN, 0.0, 1.0)
 
 	if is_instance_valid(_timer_label):
-		_timer_label.text = str(maxi(ceili(_lose_timer), 0))
+		var seconds := maxi(ceili(_lose_timer), 0)
+		_timer_label.text = str(seconds)
+		if seconds != _last_tick:
+			_last_tick = seconds
+			_punch(_timer_label, 1.5)
 		if _lose_timer <= LOSE_WARNING_TIME:
 			_timer_label.add_theme_color_override("font_color", MOVE_CAPTURE)
 
-	# Screen fades progressively to black as the timer runs out.
+	if is_instance_valid(_heart_piece):
+		_update_heart(delta, progress)
+
+	# The screen fades progressively to black as the timer runs out.
 	if is_instance_valid(_fade_overlay):
-		_fade_overlay.color.a = clampf(1.0 - _lose_timer / LOSE_COUNTDOWN, 0.0, 1.0)
+		_fade_overlay.color.a = progress
 
 	if _lose_timer <= 0.0:
 		_lose_timer = 0.0
 		_leave_to_menu()
 
 
+## A lub-dub heartbeat that slows, dims and finally cracks as time runs out.
+func _update_heart(delta: float, progress: float) -> void:
+	var period := lerpf(0.7, 2.2, progress)
+	_beat_phase = fposmod(_beat_phase + delta / period, 1.0)
+	var pulse := exp(-pow((_beat_phase - 0.08) / 0.06, 2.0)) \
+			+ 0.6 * exp(-pow((_beat_phase - 0.30) / 0.06, 2.0))
+	var strength := lerpf(0.22, 0.06, progress)
+	_heart_piece.scale = Vector2.ONE * (1.0 + strength * pulse)
+	_heart_piece.modulate = Color.WHITE.lerp(Color(0.55, 0.3, 0.3, 0.85), progress)
+
+	if not _crack_applied and _lose_timer <= LOSE_WARNING_TIME:
+		_crack_applied = true
+		var cracked := _load_optional(CRACKED_KING_PATH)
+		if cracked:
+			_heart_piece.texture = cracked
+
+
 # =============================================================================
 # Input
 # =============================================================================
 
-# Uses _input (not _unhandled_input) so UI elsewhere in the scene can't swallow
-# board clicks. _can_interact() already blocks clicks once the game is over.
+# _input (not _unhandled_input) so other UI in the scene can't swallow board clicks.
+# _can_interact() already blocks board clicks once the game is over or the shop is open.
 func _input(event: InputEvent) -> void:
 	if event is InputEventMouseMotion:
+		if _shop != null:
+			return
 		var square := _position_to_square(event.position)
 		if square != hover:
 			hover = square
 			queue_redraw()
-	elif event is InputEventKey and event.pressed and not event.echo:
+		return
+
+	if event is InputEventKey and event.pressed and not event.echo:
 		match event.keycode:
 			KEY_R:
-				_new_game()
+				if _shop == null:
+					_new_run()
 			KEY_Z, KEY_BACKSPACE:
 				_undo()
 			KEY_ESCAPE:
 				_leave_to_menu()
-	elif event is InputEventMouseButton and event.pressed:
+		return
+
+	if event is InputEventMouseButton and event.pressed:
 		if event.button_index == MOUSE_BUTTON_LEFT:
 			_handle_click(event.position)
 		elif event.button_index == MOUSE_BUTTON_RIGHT:
@@ -398,7 +507,8 @@ func _input(event: InputEvent) -> void:
 
 
 func _can_interact() -> bool:
-	return not _ai_thinking and not _is_game_over() and engine.turn == GameConfig.player_color
+	return _shop == null and not _ai_thinking and not _is_game_over() \
+			and engine.turn == GameConfig.player_color
 
 
 func _handle_click(pos: Vector2) -> void:
@@ -435,8 +545,37 @@ func _clear_selection() -> void:
 
 
 # =============================================================================
-# Game flow
+# Round flow
 # =============================================================================
+
+func _new_run() -> void:
+	run = RunState.new()
+	_start_round()
+
+
+## Resets the board, applies owned upgrades / enemy queens, and begins play.
+func _start_round() -> void:
+	_round_token += 1
+	_ai_thinking = false
+	_clear_game_over()
+	engine.reset()
+	run.begin_round(engine, GameConfig.player_color)
+	_round_enemy_material = RunState.material(engine.board, GameConfig.player_color, false)
+	_round_settled = false
+	_last_reward = {}
+	_reset_view_state()
+	_maybe_ai_move()
+
+
+func _reset_view_state() -> void:
+	_refresh_status()
+	_clear_selection()
+	hover = Vector2i(-1, -1)
+	_move_anim.stop()
+	_click_anim.stop()
+	_reset_anim.start(RESET_ANIM_TIME)
+	queue_redraw()
+
 
 func _make_move(from: Vector2i, to: Vector2i) -> void:
 	engine.make_move(from, to)
@@ -454,12 +593,12 @@ func _maybe_ai_move() -> void:
 		return
 
 	_ai_thinking = true
-	var generation := _ai_generation
+	var token := _round_token
 	queue_redraw()
 
 	await get_tree().create_timer(AI_THINK_DELAY).timeout
-	# The game may have been reset or the scene left while we waited.
-	if not is_inside_tree() or generation != _ai_generation:
+	# The round may have been reset or the scene left while we waited.
+	if not is_inside_tree() or token != _round_token:
 		return
 
 	var move: Array = ai.choose_move(engine)
@@ -470,18 +609,14 @@ func _maybe_ai_move() -> void:
 	queue_redraw()
 
 
-func _new_game() -> void:
-	_ai_generation += 1
-	_ai_thinking = false
-	_clear_game_over()
-	engine.reset()
-	_reset_view_state()
-	_maybe_ai_move()
-
-
 func _undo() -> void:
-	if _ai_thinking:
+	if _ai_thinking or _shop != null or _is_game_over() or engine.history.is_empty():
 		return
+	if run.undos_left <= 0:
+		_toast("No undos left!")
+		return
+	run.undos_left -= 1
+
 	# Roll back until it is the player's turn again (undoes the AI reply too).
 	for i in range(2):
 		if engine.history.is_empty():
@@ -494,14 +629,74 @@ func _undo() -> void:
 	_maybe_ai_move()
 
 
-func _reset_view_state() -> void:
-	_refresh_status()
-	_clear_selection()
-	hover = Vector2i(-1, -1)
-	_move_anim.stop()
-	_click_anim.stop()
-	_reset_anim.start(RESET_ANIM_TIME)
-	queue_redraw()
+func _settle_round(won: bool) -> void:
+	if _round_settled:
+		return
+	_round_settled = true
+	_last_reward = run.settle_round(engine, GameConfig.player_color, _round_enemy_material, won)
+
+
+func _check_game_state() -> void:
+	if not _is_game_over():
+		_clear_game_over()
+		return
+	if _game_over_layer != null or _defeat_pending:
+		return
+
+	if _status == ChessEngine.Status.STALEMATE:
+		_settle_round(false)
+		_show_draw_menu()
+	elif engine.turn == GameConfig.player_color:
+		if run.use_extra_life():
+			_second_wind()
+			return
+		_settle_round(false)
+		_show_lose_menu()
+	else:
+		_settle_round(true)
+		_show_win_menu()
+
+
+## Consumes a Second Wind: rewinds the last couple of moves instead of losing.
+func _second_wind() -> void:
+	var plies := 0
+	while plies < SECOND_WIND_PLIES and not engine.history.is_empty():
+		engine.undo()
+		plies += 1
+	while engine.turn != GameConfig.player_color and not engine.history.is_empty():
+		engine.undo()
+	_toast("Second Wind! The board rewinds.")
+	_reset_view_state()
+	_maybe_ai_move()
+
+
+func _on_win_continue() -> void:
+	run.advance_round(true)   # the opponent earns an extra queen
+	_start_round()
+
+
+func _on_draw_continue() -> void:
+	_start_round()
+
+
+func _on_lose_continue() -> void:
+	_open_shop()
+
+
+func _open_shop() -> void:
+	_clear_game_over()
+	_shop = ShopScreen.new()
+	_shop.setup(run, _last_reward)
+	_shop.next_round_requested.connect(_on_shop_closed)
+	add_child(_shop)
+
+
+func _on_shop_closed() -> void:
+	if _shop != null:
+		_shop.queue_free()
+		_shop = null
+	run.advance_round(false)
+	_start_round()
 
 
 func _leave_to_menu() -> void:
@@ -529,65 +724,94 @@ func _leave_to_menu() -> void:
 # Game-over menus
 # =============================================================================
 
-func _check_game_state() -> void:
-	if not _is_game_over():
-		_clear_game_over()
-		return
-	if _game_over_layer != null:
-		return
-
-	if _status == ChessEngine.Status.STALEMATE:
-		_show_draw_menu()
-	elif engine.turn == GameConfig.player_color:
-		_show_lose_menu()
-	else:
-		_show_win_menu()
-
-
 func _show_win_menu() -> void:
 	var vbox := _open_game_over_menu("Checkmate!", "You defeated the opponent.")
-	vbox.add_child(_make_button("Play Again", _new_game))
+	_add_reward_label(vbox)
+	vbox.add_child(_make_label("The opponent will gain an extra Queen.", 16, MOVE_CAPTURE))
+	vbox.add_child(_make_button("Keep Playing", _on_win_continue))
 	vbox.add_child(_make_button("Quit to Menu", _leave_to_menu))
 
 
 func _show_draw_menu() -> void:
 	var vbox := _open_game_over_menu("Draw", "The game ended in stalemate.")
-	vbox.add_child(_make_button("Play Again", _new_game))
+	_add_reward_label(vbox)
+	vbox.add_child(_make_button("Play Again", _on_draw_continue))
 	vbox.add_child(_make_button("Quit to Menu", _leave_to_menu))
 
 
+## Defeat: screen shake + red flash, then the menu slams in over falling pieces,
+## with a heartbeat that slows down as the countdown runs out.
 func _show_lose_menu() -> void:
+	_defeat_pending = true
+	_play_defeat_impact()
+
+	var token := _round_token
+	await get_tree().create_timer(DEFEAT_MENU_DELAY).timeout
+	if token != _round_token or _leaving or not is_inside_tree():
+		return
+	_defeat_pending = false
+
 	var vbox := _open_game_over_menu("You lose", "", true)
 
 	_heart_piece = TextureRect.new()
 	_heart_piece.texture = piece_textures[WHITE_KING_CODE]
 	_heart_piece.expand_mode = TextureRect.EXPAND_IGNORE_SIZE
 	_heart_piece.stretch_mode = TextureRect.STRETCH_KEEP_ASPECT_CENTERED
+	_heart_piece.texture_filter = CanvasItem.TEXTURE_FILTER_NEAREST
 	_heart_piece.custom_minimum_size = Vector2(120, 120)
 	_heart_piece.pivot_offset = Vector2(60, 60)
 	vbox.add_child(_heart_piece)
 
 	_timer_label = _make_label(str(int(LOSE_COUNTDOWN)), 48, TEXT)
+	_timer_label.pivot_offset = Vector2(30, 28)
 	vbox.add_child(_timer_label)
 
-	vbox.add_child(_make_button("Continue Playing", _new_game))
+	_add_reward_label(vbox)
+	vbox.add_child(_make_button("Continue Playing", _on_lose_continue))
 	vbox.add_child(_make_button("Quit", _leave_to_menu))
 
 	_lose_timer = LOSE_COUNTDOWN
-	_play_heartbeat(_heart_piece)
+	_last_tick = int(LOSE_COUNTDOWN)
+	_beat_phase = 0.0
+	_crack_applied = false
+
+
+func _play_defeat_impact() -> void:
+	_shake_anim.start(DEFEAT_SHAKE_TIME)
+
+	var flash_layer := CanvasLayer.new()
+	flash_layer.layer = 60
+	add_child(flash_layer)
+	var flash := ColorRect.new()
+	flash.set_anchors_preset(Control.PRESET_FULL_RECT)
+	flash.color = Color(0.75, 0.12, 0.12, 0.55)
+	flash.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	flash_layer.add_child(flash)
+
+	var tween := flash.create_tween()
+	tween.tween_property(flash, "color:a", 0.0, 0.7)
+	tween.tween_callback(flash_layer.queue_free)
+
+
+func _add_reward_label(vbox: VBoxContainer) -> void:
+	var total := int(_last_reward.get("total", 0))
+	if total > 0:
+		vbox.add_child(_make_label("Earned $%d" % total, 20, GOLD))
 
 
 ## Builds the shared dim backdrop + centered panel and returns the panel's VBox.
-func _open_game_over_menu(title_text: String, subtitle: String, with_fade: bool = false) -> VBoxContainer:
+func _open_game_over_menu(title_text: String, subtitle: String, lose_style: bool = false) -> VBoxContainer:
 	_game_over_layer = CanvasLayer.new()
 	add_child(_game_over_layer)
 
 	var dim := ColorRect.new()
 	dim.set_anchors_preset(Control.PRESET_FULL_RECT)
-	dim.color = OVERLAY_DIM
+	dim.color = Color(OVERLAY_DIM, 0.0)
 	_game_over_layer.add_child(dim)
+	dim.create_tween().tween_property(dim, "color:a", OVERLAY_DIM.a, 0.6)
 
-	if with_fade:
+	if lose_style:
+		_spawn_falling_pieces()
 		_fade_overlay = ColorRect.new()
 		_fade_overlay.set_anchors_preset(Control.PRESET_FULL_RECT)
 		_fade_overlay.color = Color(0, 0, 0, 0)
@@ -611,31 +835,66 @@ func _open_game_over_menu(title_text: String, subtitle: String, with_fade: bool 
 	vbox.add_theme_constant_override("separation", 20)
 	panel.add_child(vbox)
 
-	vbox.add_child(_make_label(title_text, 38, ACCENT))
+	var title := _make_label(title_text, 38, ACCENT)
+	vbox.add_child(title)
+	if lose_style:
+		# Letters appear one by one, like a verdict being read out.
+		title.visible_ratio = 0.0
+		var reveal := title.create_tween()
+		reveal.tween_interval(0.25)
+		reveal.tween_property(title, "visible_ratio", 1.0, 0.8)
 	if subtitle != "":
 		vbox.add_child(_make_label(subtitle, 18, TEXT))
 
-	_animate_menu_popup(panel)
+	_animate_menu_popup(panel, lose_style)
 	return vbox
 
 
-func _clear_game_over() -> void:
-	if _heart_tween and _heart_tween.is_valid():
-		_heart_tween.kill()
-	_heart_tween = null
+## Faint chess pieces drifting down behind the defeat panel.
+func _spawn_falling_pieces() -> void:
+	var view := get_viewport().get_visible_rect().size
+	var codes := [-1, -2, -3, -4, -5, -6, 1, 2, 3, 4, 5, 6]
+	for i in range(FALLING_PIECE_COUNT):
+		var texture: Texture2D = piece_textures.get(codes.pick_random())
+		if texture == null:
+			continue
+		var size := randf_range(36.0, 72.0)
+		var sprite := TextureRect.new()
+		sprite.texture = texture
+		sprite.expand_mode = TextureRect.EXPAND_IGNORE_SIZE
+		sprite.stretch_mode = TextureRect.STRETCH_KEEP_ASPECT_CENTERED
+		sprite.texture_filter = CanvasItem.TEXTURE_FILTER_NEAREST
+		sprite.mouse_filter = Control.MOUSE_FILTER_IGNORE
+		sprite.custom_minimum_size = Vector2(size, size)
+		sprite.size = Vector2(size, size)
+		sprite.pivot_offset = Vector2(size, size) / 2.0
+		sprite.modulate = Color(1, 1, 1, randf_range(0.12, 0.3))
+		sprite.position = Vector2(randf_range(0.0, view.x), randf_range(-view.y, 0.0))
+		var start_rotation := randf_range(-0.6, 0.6)
+		sprite.rotation = start_rotation
+		_game_over_layer.add_child(sprite)
 
+		var duration := randf_range(4.0, 8.0)
+		var fall := sprite.create_tween().set_loops()
+		fall.tween_property(sprite, "position:y", view.y + 80.0, duration).from(-100.0)
+		var spin := sprite.create_tween().set_loops()
+		spin.tween_property(sprite, "rotation", start_rotation + randf_range(-2.0, 2.0), duration).from(start_rotation)
+
+
+func _clear_game_over() -> void:
 	if _game_over_layer != null:
 		_game_over_layer.queue_free()
 		_game_over_layer = null
 
+	_defeat_pending = false
 	_heart_piece = null
 	_timer_label = null
 	_fade_overlay = null
 	_lose_timer = 0.0
 
 
-func _animate_menu_popup(target: Control) -> void:
-	target.scale = Vector2(0.6, 0.6)
+func _animate_menu_popup(target: Control, slam: bool = false) -> void:
+	target.scale = Vector2(1.6, 1.6) if slam else Vector2(0.6, 0.6)
 	target.modulate.a = 0.0
 
 	# Container sizes are only known after the first layout pass.
@@ -644,19 +903,19 @@ func _animate_menu_popup(target: Control) -> void:
 		return
 	target.pivot_offset = target.size / 2.0
 
-	var tween := create_tween().set_parallel(true)
-	tween.tween_property(target, "scale", Vector2.ONE, 0.35).set_trans(Tween.TRANS_BACK).set_ease(Tween.EASE_OUT)
+	var tween := target.create_tween().set_parallel(true)
+	if slam:
+		tween.tween_property(target, "scale", Vector2.ONE, 0.5).set_trans(Tween.TRANS_BOUNCE).set_ease(Tween.EASE_OUT)
+	else:
+		tween.tween_property(target, "scale", Vector2.ONE, 0.35).set_trans(Tween.TRANS_BACK).set_ease(Tween.EASE_OUT)
 	tween.tween_property(target, "modulate:a", 1.0, 0.25).set_trans(Tween.TRANS_CUBIC).set_ease(Tween.EASE_OUT)
 
 
-func _play_heartbeat(target: Control) -> void:
-	_heart_tween = create_tween().set_loops()
-	_heart_tween.tween_property(target, "scale", Vector2(1.2, 1.2), 0.15)
-	_heart_tween.tween_property(target, "scale", Vector2.ONE, 0.15)
-	_heart_tween.tween_interval(0.2)
-	_heart_tween.tween_property(target, "scale", Vector2(1.1, 1.1), 0.1)
-	_heart_tween.tween_property(target, "scale", Vector2.ONE, 0.1)
-	_heart_tween.tween_interval(0.4)
+func _punch(control: Control, amount: float) -> void:
+	control.pivot_offset = control.size / 2.0
+	control.scale = Vector2.ONE * amount
+	control.create_tween().tween_property(control, "scale", Vector2.ONE, 0.25) \
+			.set_trans(Tween.TRANS_BACK).set_ease(Tween.EASE_OUT)
 
 
 # =============================================================================
