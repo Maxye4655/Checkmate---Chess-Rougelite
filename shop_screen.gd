@@ -1,24 +1,15 @@
 class_name ShopScreen
 extends CanvasLayer
-## Balatro-flavoured between-rounds shop: calm scrolling backdrop, dealt cards,
-## coin counter, reroll, and a big "Next Round" button.
-##
-## Readability rules used throughout: nothing smaller than 16px, body text is
-## near-white on dark panels, headings get an outline, and the layout is sized
-## to fit the 1152x648 base resolution without scrolling.
-##
-## Usage:  var shop := ShopScreen.new()
-##         shop.setup(run_state, last_reward)
-##         shop.next_round_requested.connect(...)
-##         add_child(shop)
 
 signal next_round_requested
 
 const FONT_PATH := "res://Assets/CheckMate.ttf"
 const COIN_ICON_PATH := "res://Assets/UI/coin.png"   # 16x16 pixel art, drawn at 1x or 2x
+const LOCK_ICON_PATH := "res://Assets/UI/lock.png"   # 32x32 pixel art, drawn at 2x
 const CARD_SIZE := Vector2(224, 330)
 const REWARD_WIDTH := 340.0
 const OFFER_COUNT := 3
+const ITEM_ICON_PX := 64        # 32x32 art at an exact 2x
 
 const PANEL := Color("2a343a")
 const PANEL_DARK := Color("1b252a")
@@ -40,11 +31,16 @@ var reward: Dictionary = {}
 
 var _font: Font
 var _coin_texture: Texture2D
+var _lock_texture: Texture2D
 var _root: Control
 var _coin_label: Label
+var _banner: Label
+var _banner_tween: Tween
+var _challenge_button: Button
+var _overlay: Control = null
 var _cards_row: HBoxContainer
 var _reroll_button: Button
-var _owned_row: HBoxContainer
+var _owned_row: HFlowContainer
 var _card_buttons := {}      # item id -> Button
 var _displayed_coins := 0
 var _closing := false
@@ -92,6 +88,8 @@ func _ready() -> void:
 		_font = load(FONT_PATH)
 	if ResourceLoader.exists(COIN_ICON_PATH):
 		_coin_texture = load(COIN_ICON_PATH)
+	if ResourceLoader.exists(LOCK_ICON_PATH):
+		_lock_texture = load(LOCK_ICON_PATH)
 	_displayed_coins = maxi(run.coins - int(reward.get("total", 0)), 0)
 
 	add_child(Backdrop.new())
@@ -126,14 +124,23 @@ func _ready() -> void:
 	_root.modulate.a = 0.0
 	_root.create_tween().tween_property(_root, "modulate:a", 1.0, 0.3)
 	_animate_initial_coin_count()
+	_announce_fresh_unlocks()
 
 
-# =============================================================================
+func _input(event: InputEvent) -> void:
+	# Esc closes the challenges screen first (and stops the board from also reacting).
+	if _overlay != null and event is InputEventKey and event.pressed and not event.echo \
+			and event.keycode == KEY_ESCAPE:
+		_close_challenges()
+		get_viewport().set_input_as_handled()
+
+
 # Layout
-# =============================================================================
+
 
 func _build_header() -> Control:
 	var row := HBoxContainer.new()
+	row.add_theme_constant_override("separation", 16)
 
 	var sign_panel := PanelContainer.new()
 	sign_panel.add_theme_stylebox_override("panel", _box(PANEL_DARK, GOLD, 10, 4, 12))
@@ -141,9 +148,23 @@ func _build_header() -> Control:
 	row.add_child(sign_panel)
 	_sway(sign_panel)
 
-	var spacer := Control.new()
-	spacer.size_flags_horizontal = Control.SIZE_EXPAND_FILL
-	row.add_child(spacer)
+	_challenge_button = _button("", ACCENT.darkened(0.25), Vector2(240, 48), 20)
+	_challenge_button.size_flags_vertical = Control.SIZE_SHRINK_CENTER
+	_challenge_button.pressed.connect(_open_challenges)
+	row.add_child(_challenge_button)
+	_refresh_challenge_button()
+
+	# Free space between the buttons shows "NEW! Unlocked: ..." messages.
+	var banner_slot := Control.new()
+	banner_slot.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	row.add_child(banner_slot)
+	_banner = _label("", 20, GOLD, 4)
+	_banner.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
+	_banner.vertical_alignment = VERTICAL_ALIGNMENT_CENTER
+	_banner.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	banner_slot.add_child(_banner)
+	_banner.set_anchors_and_offsets_preset(Control.PRESET_FULL_RECT)
+	_banner.modulate.a = 0.0
 
 	var coin_panel := PanelContainer.new()
 	coin_panel.add_theme_stylebox_override("panel", _box(PANEL_DARK, GOLD, 10, 3, 10))
@@ -229,9 +250,11 @@ func _build_footer() -> Control:
 	var owned_title := _label("OWNED  (hover an icon for details)", 18, TEXT_DIM)
 	owned_title.horizontal_alignment = HORIZONTAL_ALIGNMENT_LEFT
 	owned_box.add_child(owned_title)
-	_owned_row = HBoxContainer.new()
+	# Wraps onto a second line instead of stretching the screen if you own a lot.
+	_owned_row = HFlowContainer.new()
 	_owned_row.custom_minimum_size.y = 36
-	_owned_row.add_theme_constant_override("separation", 14)
+	_owned_row.add_theme_constant_override("h_separation", 14)
+	_owned_row.add_theme_constant_override("v_separation", 4)
 	owned_box.add_child(_owned_row)
 	row.add_child(owned_box)
 
@@ -241,14 +264,13 @@ func _build_footer() -> Control:
 	return row
 
 
-# =============================================================================
 # Offers
-# =============================================================================
+
 
 func _available_ids() -> Array:
 	var pool: Array = []
 	for id in ShopItems.ids():
-		if run.can_buy(id):
+		if run.can_buy(id):   # also false for items whose challenge isn't done yet
 			pool.append(id)
 	return pool
 
@@ -275,27 +297,28 @@ func _roll_offers() -> void:
 
 func _build_card(id: String) -> PanelContainer:
 	var item := ShopItems.get_item(id)
-	var price := int(item["price"])
+	# Challenge rewards get a gold frame so they stand out as the stronger picks.
+	var is_reward := not Progress.challenge_for_item(id).is_empty()
 
 	var card := PanelContainer.new()
 	card.custom_minimum_size = CARD_SIZE
 	card.size_flags_vertical = Control.SIZE_SHRINK_CENTER
-	card.add_theme_stylebox_override("panel", _box(PANEL, ACCENT, 12, 3, 14))
+	card.add_theme_stylebox_override("panel", _box(PANEL, GOLD if is_reward else ACCENT, 12, 3, 14))
 	card.resized.connect(func() -> void: card.pivot_offset = card.size / 2.0)
 
 	var box := VBoxContainer.new()
-	box.add_theme_constant_override("separation", 8)
+	box.add_theme_constant_override("separation", 6)
 	card.add_child(box)
 
 	# Name (two lines reserved so every card lines up)
-	var title := _label(str(item["name"]), 22, TEXT, 3)
+	var title := _label(str(item["name"]), 22, GOLD if is_reward else TEXT, 3)
 	title.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
 	title.vertical_alignment = VERTICAL_ALIGNMENT_CENTER
 	title.custom_minimum_size = Vector2(0, 52)
 	box.add_child(title)
 
 	var icon_holder := CenterContainer.new()
-	icon_holder.add_child(_make_icon(id, 96))
+	icon_holder.add_child(_make_icon(id, ITEM_ICON_PX))
 	box.add_child(icon_holder)
 
 	var desc := _label(str(item["desc"]), 18, TEXT_SOFT)
@@ -309,7 +332,7 @@ func _build_card(id: String) -> PanelContainer:
 		box.add_child(_label("%s %d / %d" % [held_label, held, int(item["max"])], 16, ACCENT_LIGHT))
 
 	var buy := _button("", BUY_COLOR, Vector2(0, 44), 22)
-	_set_price(buy, "Buy", price)
+	_set_price(buy, "Buy", run.price_of(id))
 	buy.pressed.connect(_on_buy_pressed.bind(card, id, buy))
 	box.add_child(buy)
 	_card_buttons[id] = buy
@@ -355,6 +378,11 @@ func _on_buy_pressed(card: Control, id: String, button: Button) -> void:
 		card.modulate = Color(0.7, 0.7, 0.7)
 		_punch(card, 1.08)
 		_refresh_owned()
+		_check_new_unlocks()
+		
+		if id == "unassuming_book" and run.count("unnassuming_book") >= 5:
+			_roll_offers()
+			_show_banner("You learn the struggles of the working class...")
 	else:
 		_wiggle(card)
 		_punch(_coin_label, 1.3)
@@ -383,7 +411,9 @@ func _refresh_affordability() -> void:
 		var button: Button = _card_buttons[id]
 		if button.disabled:
 			continue
-		var color := TEXT if run.coins >= int(ShopItems.get_item(id)["price"]) else BAD
+		var price := run.price_of(id)   # updates live if you just bought a discount
+		_set_price(button, "Buy", price)
+		var color := TEXT if run.coins >= price else BAD
 		button.add_theme_color_override("font_color", color)
 		button.add_theme_color_override("font_hover_color", color)
 	_set_price(_reroll_button, "Reroll", run.reroll_cost)
@@ -402,6 +432,7 @@ func _refresh_owned() -> void:
 		var slot := HBoxContainer.new()
 		slot.add_theme_constant_override("separation", 4)
 		var icon := _make_icon(id, 32)
+		icon.mouse_filter = Control.MOUSE_FILTER_STOP   # needed for the hover tooltip
 		icon.tooltip_text = "%s - %s" % [item["name"], item["desc"]]
 		slot.add_child(icon)
 		if amount > 1:
@@ -409,9 +440,185 @@ func _refresh_owned() -> void:
 		_owned_row.add_child(slot)
 
 
-# =============================================================================
+# Challenges
+
+
+func _refresh_challenge_button() -> void:
+	_challenge_button.text = "Challenges  %d/%d" % [Progress.done_count(), Progress.total_count()]
+
+
+## Shows what was unlocked since the shop last opened (e.g. by winning a round).
+func _announce_fresh_unlocks() -> void:
+	var fresh := Progress.pop_fresh()
+	if fresh.is_empty():
+		return
+	var names: Array[String] = []
+	for item_id in fresh:
+		names.append(str(ShopItems.get_item(str(item_id))["name"]))
+	_show_banner("NEW! Unlocked: " + ", ".join(names))
+
+
+## Called after a purchase: some challenges (like buying 12 items) finish here.
+func _check_new_unlocks() -> void:
+	var newly := Progress.check_unlocks()
+	if newly.is_empty():
+		return
+	Progress.pop_fresh()   # announced right now, so don't announce again next visit
+	var names: Array[String] = []
+	for ch in newly:
+		names.append(str(ShopItems.get_item(str(ch["item"]))["name"]))
+	_show_banner("NEW! Unlocked: " + ", ".join(names))
+	_refresh_challenge_button()
+
+
+func _show_banner(text: String) -> void:
+	_banner.text = text
+	if _banner_tween != null and _banner_tween.is_valid():
+		_banner_tween.kill()
+	_banner.modulate.a = 1.0
+	_banner_tween = create_tween()
+	_banner_tween.tween_interval(4.5)
+	_banner_tween.tween_property(_banner, "modulate:a", 0.0, 0.6)
+
+
+func _open_challenges() -> void:
+	if _overlay != null:
+		return
+	_overlay = Control.new()
+	add_child(_overlay)
+	_overlay.set_anchors_and_offsets_preset(Control.PRESET_FULL_RECT)
+
+	var dim := ColorRect.new()   # swallows clicks so the shop behind can't be used
+	dim.color = Color(0, 0, 0, 0.75)
+	_overlay.add_child(dim)
+	dim.set_anchors_and_offsets_preset(Control.PRESET_FULL_RECT)
+
+	var center := CenterContainer.new()
+	_overlay.add_child(center)
+	center.set_anchors_and_offsets_preset(Control.PRESET_FULL_RECT)
+
+	var panel := PanelContainer.new()
+	panel.add_theme_stylebox_override("panel", _box(PANEL_DARK, ACCENT_LIGHT, 12, 3, 20))
+	center.add_child(panel)
+
+	var col := VBoxContainer.new()
+	col.add_theme_constant_override("separation", 10)
+	panel.add_child(col)
+
+	col.add_child(_label("CHALLENGES  %d / %d" % [Progress.done_count(), Progress.total_count()], 30, GOLD, 4))
+	col.add_child(_label("Complete a challenge to unlock a stronger boost in the shop.", 18, TEXT_SOFT))
+
+	var scroll := ScrollContainer.new()
+	scroll.custom_minimum_size = Vector2(720, 380)
+	scroll.horizontal_scroll_mode = ScrollContainer.SCROLL_MODE_DISABLED
+	col.add_child(scroll)
+
+	var list := VBoxContainer.new()
+	list.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+
+	list.add_theme_constant_override("separation", 8)
+	scroll.add_child(list)
+
+	var rows: Array = Progress.CHALLENGES.duplicate()
+	rows.sort_custom(_challenge_before)
+	for ch in rows:
+		list.add_child(_build_challenge_row(ch))
+
+	var close_row := CenterContainer.new()
+	var close := _button("Close", ACCENT.darkened(0.2), Vector2(200, 44), 22)
+	close.pressed.connect(_close_challenges)
+	close_row.add_child(close)
+	col.add_child(close_row)
+
+	_overlay.modulate.a = 0.0
+	_overlay.create_tween().tween_property(_overlay, "modulate:a", 1.0, 0.15)
+
+
+func _close_challenges() -> void:
+	if _overlay == null:
+		return
+	_overlay.queue_free()
+	_overlay = null
+
+
+## Unfinished challenges first (closest to done on top), finished ones last.
+func _challenge_before(a: Dictionary, b: Dictionary) -> bool:
+	var a_done := Progress.is_done(str(a["id"]))
+	var b_done := Progress.is_done(str(b["id"]))
+	if a_done != b_done:
+		return not a_done
+	return Progress.ratio(a) > Progress.ratio(b)
+
+
+func _build_challenge_row(ch: Dictionary) -> Control:
+	var done := Progress.is_done(str(ch["id"]))
+	var item_id := str(ch["item"])
+	var item := ShopItems.get_item(item_id)
+	var current := Progress.progress_of(ch)
+	var goal := int(ch["goal"])
+
+	var panel := PanelContainer.new()
+	panel.add_theme_stylebox_override("panel", _box(PANEL, GOOD if done else ACCENT, 8, 2, 8))
+	panel.tooltip_text = "%s - %s" % [item["name"], item["desc"]]
+
+	var row := HBoxContainer.new()
+	row.add_theme_constant_override("separation", 14)
+	panel.add_child(row)
+
+	if done:
+		row.add_child(_make_icon(item_id, ITEM_ICON_PX))
+	else:
+		row.add_child(_make_locked_icon(ITEM_ICON_PX))
+
+	var text_box := VBoxContainer.new()
+	text_box.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	text_box.alignment = BoxContainer.ALIGNMENT_CENTER
+	text_box.add_theme_constant_override("separation", 2)
+	row.add_child(text_box)
+	var title := _label(str(ch["text"]), 20, TEXT)
+	title.horizontal_alignment = HORIZONTAL_ALIGNMENT_LEFT
+	title.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
+	text_box.add_child(title)
+	var reward_label := _label("Unlocks: %s" % item["name"], 18, GOOD if done else GOLD)
+	reward_label.horizontal_alignment = HORIZONTAL_ALIGNMENT_LEFT
+	text_box.add_child(reward_label)
+
+	var right := VBoxContainer.new()
+	right.custom_minimum_size.x = 140
+	right.alignment = BoxContainer.ALIGNMENT_CENTER
+	right.add_theme_constant_override("separation", 4)
+	row.add_child(right)
+	if done:
+		right.add_child(_label("UNLOCKED", 20, GOOD))
+	else:
+		right.add_child(_label("%d / %d" % [current, goal], 22, GOLD))
+		right.add_child(_make_bar(current, goal))
+
+	# Let the mouse wheel scroll the list even while hovering a row.
+	_pass_mouse(panel)
+	return panel
+
+
+func _pass_mouse(node: Node) -> void:
+	if node is Control and not node is BaseButton:
+		(node as Control).mouse_filter = Control.MOUSE_FILTER_PASS
+	for child in node.get_children():
+		_pass_mouse(child)
+
+
+func _make_bar(value: int, goal: int) -> ProgressBar:
+	var bar := ProgressBar.new()
+	bar.min_value = 0
+	bar.max_value = goal
+	bar.value = value
+	bar.show_percentage = false
+	bar.custom_minimum_size = Vector2(130, 14)
+	bar.add_theme_stylebox_override("background", _box(OUTLINE, TEXT_DIM, 4, 1, 0))
+	bar.add_theme_stylebox_override("fill", _box(GOLD, GOLD, 4, 0, 0))
+	return bar
+
+
 # Coins
-# =============================================================================
 
 func _set_coin_display(value: float) -> void:
 	_displayed_coins = int(value)
@@ -447,10 +654,8 @@ func _set_price(button: Button, prefix: String, amount: int) -> void:
 		button.text = ("%s $%d" % [prefix, amount]).strip_edges()
 
 
-# =============================================================================
 # Small animation helpers
-# =============================================================================
-
+ 
 func _sway(control: Control) -> void:
 	await get_tree().process_frame
 	if not is_instance_valid(control):
@@ -482,9 +687,7 @@ func _fade_in(control: Control, delay: float) -> void:
 	control.create_tween().tween_property(control, "modulate:a", 1.0, 0.25).set_delay(delay)
 
 
-# =============================================================================
 # Factories
-# =============================================================================
 
 func _box(bg: Color, border: Color, radius: int, border_width: int, margin: float) -> StyleBoxFlat:
 	var box := StyleBoxFlat.new()
@@ -553,6 +756,26 @@ func _make_icon(id: String, px: int) -> Control:
 	var letter := _label(str(ShopItems.get_item(id)["name"]).substr(0, 1), int(px * 0.55), TEXT, 3)
 	letter.vertical_alignment = VERTICAL_ALIGNMENT_CENTER
 	tile.add_child(letter)
+	return tile
+
+
+## Padlock tile for challenges that aren't finished yet.
+func _make_locked_icon(px: int) -> Control:
+	var tile := PanelContainer.new()
+	tile.custom_minimum_size = Vector2(px, px)
+	tile.add_theme_stylebox_override("panel", _box(PANEL_DARK, TEXT_DIM, 8, 2, 0))
+	if _lock_texture:
+		var rect := TextureRect.new()
+		rect.texture = _lock_texture
+		rect.expand_mode = TextureRect.EXPAND_IGNORE_SIZE
+		rect.stretch_mode = TextureRect.STRETCH_KEEP_ASPECT_CENTERED
+		rect.texture_filter = CanvasItem.TEXTURE_FILTER_NEAREST
+		rect.custom_minimum_size = Vector2(px, px)
+		tile.add_child(rect)
+	else:
+		var mark := _label("?", int(px * 0.6), TEXT_DIM)
+		mark.vertical_alignment = VERTICAL_ALIGNMENT_CENTER
+		tile.add_child(mark)
 	return tile
 
 
