@@ -2,7 +2,7 @@ extends Node2D
 ## Single-player chess "run": board rendering, input, animations, and the
 ## win / lose / shop loop. Run-wide data lives in RunState, the shop in ShopScreen.
 
-# --- Scenes & layout ---------------------------------------------------------
+# --- Scenes & layout
 const MAIN_MENU_SCENE_PATH := "res://main_menu.tscn"
 const BASE_RESOLUTION := Vector2(1152, 648)
 const TILE_SIZE: int = 72
@@ -12,13 +12,13 @@ const FRAME_PADDING: float = 14.0
 const HUD_MARGIN := Vector2(40, 48)
 const TITLE_WIDTH := 207.0
 
-# --- Assets ------------------------------------------------------------------
+# --- Assets 
 const FONT_PATH := "res://Assets/CheckMate.ttf"
 const TITLE_PATH := "res://Assets/Title.png"
 const COIN_PATH := "res://Assets/UI/coin.png"                  # optional (16x16)
 const CRACKED_KING_PATH := "res://Assets/W_King_Cracked.png"   # optional, same size as W_King.png
 
-# --- Pieces ------------------------------------------------------------------
+# --- Pieces 
 const PIECE_SCALE := 0.99072        # 0.86 * 1.2 * 1.2 * 0.8
 const PAWN_SCALE_FACTOR := 0.85
 const PIECE_FILES := ["", "pawn", "knight", "bishop", "rook", "queen", "king"]
@@ -26,7 +26,7 @@ const WHITE_KING_CODE := 6
 const PIECE_SHADOW := Color(0, 0, 0, 0.28)
 const PIECE_SHADOW_OFFSET := Vector2(2, 4)
 
-# --- Palette -----------------------------------------------------------------
+# --- Palette 
 const LIGHT_SQUARE := Color("96a2a8ff")
 const DARK_SQUARE := Color("3d5662ff")
 const BOARD_FRAME := Color("464c4eff")
@@ -47,7 +47,7 @@ const ACCENT := Color("648a9dff")
 const GOLD := Color("f2c14e")
 const OVERLAY_DIM := Color(0.129, 0.18, 0.208, 0.82)
 
-# --- Timings (seconds) -------------------------------------------------------
+# --- Timings (seconds) 
 const MOVE_ANIM_TIME := 0.18
 const CLICK_ANIM_TIME := 0.22
 const RESET_ANIM_TIME := 0.45
@@ -55,7 +55,7 @@ const AI_THINK_DELAY := 0.2
 const MENU_FADE_TIME := 0.35
 const TOAST_TIME := 2.2
 
-# --- Defeat sequence ---------------------------------------------------------
+# --- Defeat sequence 
 const DEFEAT_SHAKE_TIME := 0.55
 const DEFEAT_SHAKE_STRENGTH := 14.0
 const DEFEAT_MENU_DELAY := 0.75
@@ -87,7 +87,7 @@ class Anim:
 			t = minf(t + delta / duration, 1.0)
 
 
-# --- Core objects ------------------------------------------------------------
+# --- Core objects
 var engine: ChessEngine
 var ai: ChessAI
 var run: RunState
@@ -99,7 +99,7 @@ var coin_texture: Texture2D
 var _frame_style: StyleBoxFlat
 var _title_size := Vector2.ZERO
 
-# --- Round state -------------------------------------------------------------
+# --- Round state
 var selected := Vector2i(-1, -1)
 var legal_for_selected: Array = []
 var hover := Vector2i(-1, -1)
@@ -113,7 +113,7 @@ var _last_reward: Dictionary = {}
 var _toast_text := ""
 var _toast_timer := 0.0
 
-# --- Animations --------------------------------------------------------------
+# --- Animations 
 var _move_anim := Anim.new()
 var _move_from := Vector2i.ZERO
 var _move_to := Vector2i.ZERO
@@ -123,7 +123,7 @@ var _click_square := Vector2i(-1, -1)
 var _reset_anim := Anim.new()
 var _shake_anim := Anim.new()
 
-# --- Game-over / shop UI -----------------------------------------------------
+# --- Game-over / shop UI 
 var _shop: ShopScreen = null
 var _game_over_layer: CanvasLayer = null
 var _defeat_pending := false
@@ -136,9 +136,6 @@ var _timer_label: Label = null
 var _fade_overlay: ColorRect = null
 
 
-# =============================================================================
-# Setup
-# =============================================================================
 
 func _ready() -> void:
 	engine = ChessEngine.new()
@@ -174,11 +171,6 @@ func _load_piece_texture(code: int) -> Texture2D:
 		return load(path) as Texture2D
 	push_warning("No texture found for piece '%s' (%s)" % [base, path])
 	return null
-
-
-# =============================================================================
-# Coordinate helpers (the board is flipped when the player is Black)
-# =============================================================================
 
 func _is_flipped() -> bool:
 	return GameConfig.player_color != ChessEngine.WHITE
@@ -234,11 +226,6 @@ func _toast(message: String) -> void:
 	_toast_text = message
 	_toast_timer = TOAST_TIME
 	queue_redraw()
-
-
-# =============================================================================
-# Drawing
-# =============================================================================
 
 func _draw() -> void:
 	var origin := get_board_origin()
@@ -399,10 +386,6 @@ func _status_line() -> String:
 	return line
 
 
-# =============================================================================
-# Frame update
-# =============================================================================
-
 func _process(delta: float) -> void:
 	var animating := _ai_thinking  # keeps the "thinking..." dots moving
 	for anim in [_move_anim, _click_anim, _reset_anim]:
@@ -471,10 +454,6 @@ func _update_heart(delta: float, progress: float) -> void:
 			_heart_piece.texture = cracked
 
 
-# =============================================================================
-# Input
-# =============================================================================
-
 # _input (not _unhandled_input) so other UI in the scene can't swallow board clicks.
 # _can_interact() already blocks board clicks once the game is over or the shop is open.
 func _input(event: InputEvent) -> void:
@@ -542,11 +521,6 @@ func _handle_click(pos: Vector2) -> void:
 func _clear_selection() -> void:
 	selected = Vector2i(-1, -1)
 	legal_for_selected = []
-
-
-# =============================================================================
-# Round flow
-# =============================================================================
 
 func _new_run() -> void:
 	run = RunState.new()
@@ -916,11 +890,6 @@ func _punch(control: Control, amount: float) -> void:
 	control.scale = Vector2.ONE * amount
 	control.create_tween().tween_property(control, "scale", Vector2.ONE, 0.25) \
 			.set_trans(Tween.TRANS_BACK).set_ease(Tween.EASE_OUT)
-
-
-# =============================================================================
-# UI factories
-# =============================================================================
 
 func _make_box(bg: Color, border: Color, radius: int, border_width: int) -> StyleBoxFlat:
 	var box := StyleBoxFlat.new()

@@ -31,7 +31,7 @@ static var _fresh: Array = []   # item ids unlocked but not yet announced in the
 static var _loaded := false
 
 
-# --- Persistence --------------------------------------------------------------
+# --- Persistence 
 
 static func _ensure_loaded() -> void:
 	if _loaded:
@@ -59,7 +59,7 @@ static func _save() -> void:
 	cfg.save(SAVE_PATH)
 
 
-# --- Recording stats ----------------------------------------------------------
+# --- Recording stats
 
 static func get_stat(stat: String) -> int:
 	_ensure_loaded()
@@ -79,7 +79,7 @@ static func set_max(stat: String, value: int) -> void:
 		_save()
 
 
-# --- Challenges ---------------------------------------------------------------
+# --- Challenges 
 
 static func is_done(challenge_id: String) -> bool:
 	_ensure_loaded()
@@ -144,7 +144,7 @@ static func pop_fresh() -> Array:
 	return out
 
 
-# --- Debug helpers ------------------------------------------------------------
+# --- Debug helpers
 
 static func unlock_all() -> void:
 	_ensure_loaded()

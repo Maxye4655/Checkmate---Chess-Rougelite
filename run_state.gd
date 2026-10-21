@@ -42,7 +42,7 @@ var reroll_cost := BASE_REROLL_COST
 var owned := {}            # item id -> times bought
 var revolution_used := false
 
-# --- Shop ---------------------------------------------------------------------
+# --- Shop 
 
 func count(id: String) -> int:
 	return int(owned.get(id, 0))
@@ -147,7 +147,7 @@ func use_revolution(
 func _valid_square(square: Vector2i) -> bool:
 	return square.x >= 0 and square.x < 8 and square.y >= 0 and square.y < 8
 
-# --- Per-round resources ------------------------------------------------------
+# --- Per-round resources 
 
 func lives_available() -> int:
 	return extra_lives + round_lives
@@ -210,7 +210,7 @@ func _owned_of_kind(kind: String) -> Array:
 	return found
 
 
-# --- Rounds -------------------------------------------------------------------
+# --- Rounds
 
 func advance_round(won: bool) -> void:
 	if won:
@@ -315,7 +315,7 @@ static func material(board, player_color: int, mine: bool) -> int:
 	return total
 
 
-# --- Rewards ------------------------------------------------------------------
+# --- Rewards 
 
 ## Pays out for the round that just ended. Returns {"lines": [[label, amount]...], "total": int}.
 func settle_round(engine: ChessEngine, player_color: int, enemy_start_material: int, won: bool, lost: bool = false) -> Dictionary:
