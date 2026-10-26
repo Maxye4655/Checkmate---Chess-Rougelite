@@ -251,7 +251,7 @@ func _apply_loadout(engine: ChessEngine, player_color: int) -> void:
 	var promotions: Array[int] = []
 	for entry in _owned_of_kind("start_piece"):
 		for i in range(int(entry["count"])):
-			for piece in entry["item"]["pieces"]:
+			for piece in entry["item"]["piece"]:
 				promotions.append(int(piece))
 	promotions.sort()
 	promotions.reverse()
