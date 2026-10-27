@@ -64,6 +64,9 @@ const LOSE_WARNING_TIME := 3.0
 const FALLING_PIECE_COUNT := 16
 const SECOND_WIND_PLIES := 4
 
+# --- Multiplayer
+const UNDO_PROMPT_TIME := 15.0      # the opponent's "allow undo?" popup auto-declines after this
+
 const FILES := "abcdefgh"
 
 
@@ -107,7 +110,7 @@ var _status: int = 0
 var _leaving := false
 var _ai_thinking := false
 var _round_token := 0               # bumped each round so stale async work is discarded
-var _round_enemy_material := 0
+var _enemy_material := {}           # colour -> material of that colour's opponent at round start
 var _round_settled := false
 var _last_reward: Dictionary = {}
 var _toast_text := ""
@@ -135,12 +138,30 @@ var _heart_piece: TextureRect = null
 var _timer_label: Label = null
 var _fade_overlay: ColorRect = null
 
+# --- Multiplayer state
+var _players: Array = []                # LOCAL: [player 1's RunState, player 2's RunState]
+var _p1_color := ChessEngine.WHITE      # LOCAL: player 1's colour this round (swaps every round)
+var _rounds_started := 0                # rounds begun this session (also the ONLINE handshake id)
+var _score := [0, 0]                    # wins: [me / player 1, opponent / player 2]
+var _rewards := {}                      # colour -> reward breakdown from settle_round
+var _result := {}                       # {"winner": colour} once settled (0 = draw)
+var _awaiting_setup := false            # ONLINE: waiting for the shared starting board
+var _opponent_loadout := {}             # ONLINE host: the guest's loadout for this round
+var _opponent_loadout_seq := -1
+var _awaiting_mate_verdict := false     # ONLINE: opponent is mated; waiting to hear if a life saves them
+var _pending_undo := false              # ONLINE: I asked for a take-back and am waiting for the answer
+var _prompt_layer: CanvasLayer = null   # ONLINE: the "opponent wants an undo" popup
+var _prompt_target := 0
+var _prompt_timer := 0.0
+
 
 
 func _ready() -> void:
 	engine = ChessEngine.new()
 	ai = ChessAI.new()
 	run = RunState.new()
+	if _is_local():
+		_players = [run, RunState.new()]   # hot-seat: each player has their own run
 	font = load(FONT_PATH)
 	title_texture = load(TITLE_PATH)
 	coin_texture = _load_optional(COIN_PATH)
@@ -156,7 +177,23 @@ func _ready() -> void:
 	_frame_style.shadow_size = 18
 	_frame_style.shadow_offset = Vector2(0, 6)
 
+	if _is_online():
+		NetworkManager.move_received.connect(_on_remote_move)
+		NetworkManager.opponent_left.connect(_on_opponent_left)
+		NetworkManager.loadout_received.connect(_on_loadout_received)
+		NetworkManager.round_setup_received.connect(_on_round_setup_received)
+		NetworkManager.mate_verdict_received.connect(_on_mate_verdict)
+		NetworkManager.undo_requested.connect(_on_undo_requested)
+		NetworkManager.undo_answered.connect(_on_undo_answered)
+
 	_start_round()
+
+	if _is_online():
+		NetworkManager.set_board_ready(true)   # delivers anything that arrived while loading
+
+
+func _exit_tree() -> void:
+	NetworkManager.set_board_ready(false)
 
 
 func _load_optional(path: String) -> Texture2D:
@@ -172,7 +209,46 @@ func _load_piece_texture(code: int) -> Texture2D:
 	push_warning("No texture found for piece '%s' (%s)" % [base, path])
 	return null
 
+# --- Mode helpers
+
+func _is_single() -> bool:
+	return GameConfig.mode == GameConfig.Mode.SINGLE
+
+
+func _is_local() -> bool:
+	return GameConfig.mode == GameConfig.Mode.LOCAL
+
+
+func _is_online() -> bool:
+	return GameConfig.mode == GameConfig.Mode.ONLINE
+
+
+func _is_host() -> bool:
+	return _is_online() and multiplayer.is_server()
+
+
+## The run belonging to a colour. Single player / online only have your own run.
+func _run_of(color: int) -> RunState:
+	if _is_local():
+		return _players[0] if color == _p1_color else _players[1]
+	return run
+
+
+## Colours whose rewards, lives and undos this machine is responsible for.
+func _owned_colors() -> Array:
+	if _is_local():
+		return [ChessEngine.WHITE, ChessEngine.BLACK]
+	return [GameConfig.player_color]
+
+
+func _player_label(color: int) -> String:
+	var number := 1 if color == _p1_color else 2
+	return "Player %d (%s)" % [number, _color_name(color)]
+
+
 func _is_flipped() -> bool:
+	if _is_local():
+		return false   # hot-seat: White always sits at the bottom
 	return GameConfig.player_color != ChessEngine.WHITE
 
 
@@ -288,6 +364,8 @@ func _draw_coordinates(origin: Vector2) -> void:
 
 
 func _draw_pieces() -> void:
+	if _awaiting_setup:
+		return   # the real starting position isn't known yet
 	var reset_scale := 1.0
 	if _reset_anim.is_active():
 		var p := _reset_anim.t
@@ -337,21 +415,36 @@ func _draw_hud() -> void:
 	var x := HUD_MARGIN.x
 	var y := HUD_MARGIN.y + _title_size.y + 30.0
 
-	var mode_label := "Single Player  (You are %s)" % _color_name(GameConfig.player_color)
-	draw_string(font, Vector2(x, y), mode_label, HORIZONTAL_ALIGNMENT_LEFT, -1, 18, TEXT_DIM)
+	draw_string(font, Vector2(x, y), _mode_label(), HORIZONTAL_ALIGNMENT_LEFT, -1, 18, TEXT_DIM)
 	draw_string(font, Vector2(x, y + 38), _status_line(), HORIZONTAL_ALIGNMENT_LEFT, -1, 30, ACCENT)
-	_draw_run_info(x, y + 92.0)
+	if _is_local():
+		_draw_run_info(x, y + 92.0, _players[0], "Player 1 (%s)" % _color_name(_p1_color))
+		_draw_run_info(x + 230.0, y + 92.0, _players[1], "Player 2 (%s)" % _color_name(-_p1_color))
+	else:
+		_draw_run_info(x, y + 92.0, run)
 
 	if _toast_timer > 0.0:
 		var color := Color(GOLD, clampf(_toast_timer, 0.0, 1.0))
 		draw_string(font, Vector2(x, BASE_RESOLUTION.y - 64), _toast_text, HORIZONTAL_ALIGNMENT_LEFT, -1, 20, color)
 
 	var hint := "R  New run        Z  Undo        Esc  Menu"
+	if _is_online():
+		hint = "Z  Ask for undo        Esc  Menu"
 	draw_string(font, Vector2(x, BASE_RESOLUTION.y - 28), hint, HORIZONTAL_ALIGNMENT_LEFT, -1, 16, TEXT_DIM)
 
 
-func _draw_run_info(x: float, y: float) -> void:
-	draw_string(font, Vector2(x, y), "Round %d" % run.round_number, HORIZONTAL_ALIGNMENT_LEFT, -1, 20, TEXT)
+func _mode_label() -> String:
+	if _is_local():
+		return "Local 2-Player   |   Score  %d - %d" % [_score[0], _score[1]]
+	if _is_online():
+		return "Online  (You are %s)   |   Score  %d - %d" % [_color_name(GameConfig.player_color), _score[0], _score[1]]
+	return "Single Player  (You are %s)" % _color_name(GameConfig.player_color)
+
+
+func _draw_run_info(x: float, y: float, r: RunState, header: String = "") -> void:
+	if header != "":
+		draw_string(font, Vector2(x, y - 34.0), header, HORIZONTAL_ALIGNMENT_LEFT, -1, 16, ACCENT)
+	draw_string(font, Vector2(x, y), "Round %d" % r.round_number, HORIZONTAL_ALIGNMENT_LEFT, -1, 20, TEXT)
 	y += 40.0
 
 	var coin_pos := Vector2(x, y - 26.0)
@@ -360,16 +453,16 @@ func _draw_run_info(x: float, y: float) -> void:
 	else:
 		draw_circle(coin_pos + Vector2(16, 16), 13.0, GOLD)
 		draw_arc(coin_pos + Vector2(16, 16), 13.0, 0.0, TAU, 24, GOLD.darkened(0.4), 2.0, true)
-	draw_string(font, Vector2(x + 42.0, y), str(run.coins), HORIZONTAL_ALIGNMENT_LEFT, -1, 26, GOLD)
+	draw_string(font, Vector2(x + 42.0, y), str(r.coins), HORIZONTAL_ALIGNMENT_LEFT, -1, 26, GOLD)
 	y += 32.0
 
-	draw_string(font, Vector2(x, y), "Undos  %d" % run.undos_left, HORIZONTAL_ALIGNMENT_LEFT, -1, 18, TEXT_DIM)
+	draw_string(font, Vector2(x, y), "Undos  %d" % r.undos_left, HORIZONTAL_ALIGNMENT_LEFT, -1, 18, TEXT_DIM)
 	y += 26.0
-	if run.extra_lives > 0:
-		draw_string(font, Vector2(x, y), "Second Winds  %d" % run.extra_lives, HORIZONTAL_ALIGNMENT_LEFT, -1, 18, TEXT_DIM)
+	if r.extra_lives > 0:
+		draw_string(font, Vector2(x, y), "Second Winds  %d" % r.extra_lives, HORIZONTAL_ALIGNMENT_LEFT, -1, 18, TEXT_DIM)
 		y += 26.0
-	if run.enemy_queens > 0:
-		draw_string(font, Vector2(x, y), "Enemy Queens  %d" % run.enemy_queens, HORIZONTAL_ALIGNMENT_LEFT, -1, 18, MOVE_CAPTURE)
+	if r.enemy_queens > 0:
+		draw_string(font, Vector2(x, y), "Enemy Queens  %d" % r.enemy_queens, HORIZONTAL_ALIGNMENT_LEFT, -1, 18, MOVE_CAPTURE)
 
 
 func _status_line() -> String:
@@ -377,17 +470,26 @@ func _status_line() -> String:
 		return "Checkmate"
 	if _status == ChessEngine.Status.STALEMATE:
 		return "Stalemate"
-	if _ai_thinking or engine.turn != GameConfig.player_color:
-		var dots := ".".repeat(int(Time.get_ticks_msec() * 0.0025) % 4)
+
+	var dots := ".".repeat(int(Time.get_ticks_msec() * 0.0025) % 4)
+	if _is_online():
+		if _awaiting_setup:
+			return "Waiting for opponent" + dots
+		if _pending_undo:
+			return "Undo requested" + dots
+	elif _is_single() and (_ai_thinking or engine.turn != GameConfig.player_color):
 		return "Computer is thinking" + dots
+
 	var line := _color_name(engine.turn) + " to move"
+	if _is_online() and engine.turn != GameConfig.player_color:
+		line = "Opponent's move"
 	if _status == ChessEngine.Status.CHECK:
 		line += "  -  Check!"
 	return line
 
 
 func _process(delta: float) -> void:
-	var animating := _ai_thinking  # keeps the "thinking..." dots moving
+	var animating := _ai_thinking or _awaiting_setup or _pending_undo   # keeps the "..." dots moving
 	for anim in [_move_anim, _click_anim, _reset_anim]:
 		if anim.is_active():
 			anim.step(delta)
@@ -406,6 +508,11 @@ func _process(delta: float) -> void:
 
 	if animating:
 		queue_redraw()
+
+	if _prompt_layer != null:
+		_prompt_timer -= delta
+		if _prompt_timer <= 0.0:
+			_answer_undo(false, _prompt_target)   # no answer in time counts as "no"
 
 	_update_lose_countdown(delta)
 
@@ -469,7 +576,7 @@ func _input(event: InputEvent) -> void:
 	if event is InputEventKey and event.pressed and not event.echo:
 		match event.keycode:
 			KEY_R:
-				if _shop == null:
+				if _shop == null and not _is_online():
 					_new_run()
 			KEY_Z, KEY_BACKSPACE:
 				_undo()
@@ -486,8 +593,13 @@ func _input(event: InputEvent) -> void:
 
 
 func _can_interact() -> bool:
-	return _shop == null and not _ai_thinking and not _is_game_over() \
-			and engine.turn == GameConfig.player_color
+	if _shop != null or _ai_thinking or _is_game_over() or _prompt_layer != null:
+		return false
+	if _awaiting_setup or _pending_undo:
+		return false
+	if _is_local():
+		return true   # whoever's turn it is plays
+	return engine.turn == GameConfig.player_color
 
 
 func _handle_click(pos: Vector2) -> void:
@@ -501,6 +613,8 @@ func _handle_click(pos: Vector2) -> void:
 		return
 
 	if selected != Vector2i(-1, -1) and square in legal_for_selected:
+		if _is_online():
+			NetworkManager.send_move(selected, square)
 		_make_move(selected, square)
 		_clear_selection()
 		queue_redraw()
@@ -523,22 +637,113 @@ func _clear_selection() -> void:
 	legal_for_selected = []
 
 func _new_run() -> void:
-	run = RunState.new()
+	if _is_local():
+		_players = [RunState.new(), RunState.new()]
+		run = _players[0]
+		_p1_color = ChessEngine.WHITE
+		_rounds_started = 0
+		_score = [0, 0]
+	else:
+		run = RunState.new()
 	_start_round()
 
 
 ## Resets the board, applies owned upgrades / enemy queens, and begins play.
 func _start_round() -> void:
 	_round_token += 1
+	_rounds_started += 1
 	_ai_thinking = false
+	_awaiting_mate_verdict = false
+	_pending_undo = false
+	_clear_prompt()
 	_clear_game_over()
-	engine.reset()
-	run.begin_round(engine, GameConfig.player_color)
-	_round_enemy_material = RunState.material(engine.board, GameConfig.player_color, false)
 	_round_settled = false
 	_last_reward = {}
+	_rewards = {}
+	_result = {}
+
+	if _is_local():
+		_setup_local_round()
+	elif _is_online():
+		_setup_online_round()
+	else:
+		_setup_single_round()
+
 	_reset_view_state()
 	_maybe_ai_move()
+
+
+func _setup_single_round() -> void:
+	engine.reset()
+	run.begin_round(engine, GameConfig.player_color)
+	_record_start_material()
+
+
+## Hot-seat: both players have their own run, and the colours swap every round.
+func _setup_local_round() -> void:
+	if _rounds_started > 1:
+		_p1_color = -_p1_color
+	engine.reset()
+	var p1: RunState = _players[0]
+	var p2: RunState = _players[1]
+	p1.refill_round_resources()
+	p2.refill_round_resources()
+	RunState.apply_versus_loadouts(engine, p1, _p1_color, p2, -_p1_color)
+	_record_start_material()
+
+
+## Online: the HOST builds the board from both players' loadouts and sends it, so the
+## random parts (which pawn is promoted, which enemy piece becomes a queen...) match.
+func _setup_online_round() -> void:
+	if _rounds_started > 1:
+		GameConfig.player_color = -GameConfig.player_color   # colours swap every round
+	engine.reset()
+	run.refill_round_resources()
+	_awaiting_setup = true
+	if _is_host():
+		_try_host_build_round()   # builds now if the guest's loadout already arrived
+	else:
+		NetworkManager.send_loadout(_rounds_started, run.export_loadout())
+
+
+func _record_start_material() -> void:
+	_enemy_material = {
+		ChessEngine.WHITE: RunState.material(engine.board, ChessEngine.WHITE, false),
+		ChessEngine.BLACK: RunState.material(engine.board, ChessEngine.BLACK, false),
+	}
+
+
+func _try_host_build_round() -> void:
+	if not _is_host() or not _awaiting_setup:
+		return
+	if _opponent_loadout.is_empty() or _opponent_loadout_seq != _rounds_started:
+		return
+	var guest_run := RunState.from_loadout(_opponent_loadout)
+	_opponent_loadout = {}
+	engine.reset()
+	RunState.apply_versus_loadouts(engine, run, GameConfig.player_color, guest_run, -GameConfig.player_color)
+	NetworkManager.send_round_setup(_rounds_started, engine.board)
+	_finish_online_setup()
+
+
+func _on_loadout_received(seq: int, loadout: Dictionary) -> void:
+	_opponent_loadout = loadout
+	_opponent_loadout_seq = seq
+	_try_host_build_round()
+
+
+func _on_round_setup_received(seq: int, board: Array) -> void:
+	if _is_host() or not _awaiting_setup or seq != _rounds_started or board.size() != 8:
+		return
+	engine.reset()
+	engine.board = board
+	_finish_online_setup()
+
+
+func _finish_online_setup() -> void:
+	_awaiting_setup = false
+	_record_start_material()
+	_reset_view_state()
 
 
 func _reset_view_state() -> void:
@@ -562,7 +767,24 @@ func _make_move(from: Vector2i, to: Vector2i) -> void:
 	_check_game_state()
 
 
+## ONLINE: the opponent's move arrived. Never trust the network: re-check legality.
+func _on_remote_move(from: Vector2i, to: Vector2i) -> void:
+	if _awaiting_setup or _awaiting_mate_verdict or _is_game_over():
+		return
+	if engine.turn == GameConfig.player_color:
+		return   # not their turn
+	if not (to in engine.legal_moves(from)):
+		push_warning("Rejected illegal remote move %s -> %s" % [from, to])
+		return
+	_make_move(from, to)
+	_clear_selection()
+	queue_redraw()
+
+
 func _maybe_ai_move() -> void:
+	if not _is_single():
+		return   # only single player has a computer opponent
+
 	if _ai_thinking or engine.turn == GameConfig.player_color or _is_game_over():
 		return
 
@@ -584,7 +806,18 @@ func _maybe_ai_move() -> void:
 
 
 func _undo() -> void:
-	if _ai_thinking or _shop != null or _is_game_over() or engine.history.is_empty():
+	if _shop != null or _is_game_over() or _prompt_layer != null or engine.history.is_empty():
+		return
+	if _is_local():
+		_undo_local()
+	elif _is_online():
+		_request_online_undo()
+	else:
+		_undo_single()
+
+
+func _undo_single() -> void:
+	if _ai_thinking:
 		return
 	if run.undos_left <= 0:
 		_toast("No undos left!")
@@ -603,26 +836,169 @@ func _undo() -> void:
 	_maybe_ai_move()
 
 
+## How many moves the history should hold after `color` takes back their last move
+## (and anything the opponent played in reply). -1 if that colour hasn't moved yet.
+func _undo_target(color: int) -> int:
+	for i in range(engine.history.size() - 1, -1, -1):
+		if engine.history[i]["turn"] == color:
+			return i
+	return -1
+
+
+func _rewind_to(history_size: int) -> void:
+	while engine.history.size() > history_size:
+		engine.undo()
+	_clear_game_over()
+	_reset_view_state()
+
+
+## Hot-seat: the player to move spends one of THEIR undos (both people are at the screen).
+func _undo_local() -> void:
+	var color := engine.turn
+	var target := _undo_target(color)
+	if target < 0:
+		_toast("Nothing to undo")
+		return
+	var player := _run_of(color)
+	if player.undos_left <= 0:
+		_toast("%s has no undos left!" % _player_label(color))
+		return
+	player.undos_left -= 1
+	_rewind_to(target)
+
+
+## Online: an undo needs the opponent's consent. It only costs you an undo if accepted.
+func _request_online_undo() -> void:
+	if _pending_undo or _awaiting_setup or _awaiting_mate_verdict:
+		return
+	var target := _undo_target(GameConfig.player_color)
+	if target < 0:
+		_toast("Nothing to undo")
+		return
+	if run.undos_left <= 0:
+		_toast("No undos left!")
+		return
+	_pending_undo = true
+	_clear_selection()
+	NetworkManager.send_undo_request(target, engine.history.size())
+	queue_redraw()
+
+
+func _on_undo_requested(target: int, history_size: int) -> void:
+	# Decline automatically if our boards no longer line up (a move crossed the request).
+	var stale := history_size != engine.history.size() or target < 0 or target >= history_size
+	if stale or _pending_undo or _awaiting_setup or _awaiting_mate_verdict \
+			or _is_game_over() or _shop != null:
+		NetworkManager.send_undo_answer(false, target)
+		return
+	_show_undo_prompt(target)
+
+
+func _on_undo_answered(accepted: bool, target: int) -> void:
+	if not _pending_undo:
+		return
+	_pending_undo = false
+	if accepted:
+		run.undos_left -= 1
+		_rewind_to(target)
+		_toast("Undo accepted")
+	else:
+		_toast("Undo declined")
+	queue_redraw()
+
+
+func _answer_undo(accepted: bool, target: int) -> void:
+	_clear_prompt()
+	NetworkManager.send_undo_answer(accepted, target)
+	if accepted:
+		_rewind_to(target)
+
+
+func _show_undo_prompt(target: int) -> void:
+	_clear_prompt()
+	_clear_selection()
+	_prompt_target = target
+	_prompt_timer = UNDO_PROMPT_TIME
+
+	_prompt_layer = CanvasLayer.new()
+	_prompt_layer.layer = 50
+	add_child(_prompt_layer)
+
+	var center := CenterContainer.new()
+	center.set_anchors_preset(Control.PRESET_FULL_RECT)
+	_prompt_layer.add_child(center)
+
+	var panel := PanelContainer.new()
+	var style := _make_box(BOARD_FRAME, BOARD_FRAME_INNER, 6, 3)
+	style.content_margin_left = 32
+	style.content_margin_right = 32
+	style.content_margin_top = 24
+	style.content_margin_bottom = 24
+	panel.add_theme_stylebox_override("panel", style)
+	center.add_child(panel)
+
+	var vbox := VBoxContainer.new()
+	vbox.add_theme_constant_override("separation", 16)
+	panel.add_child(vbox)
+	vbox.add_child(_make_label("Undo request", 30, ACCENT))
+	vbox.add_child(_make_label("Your opponent wants to take back their last move.", 18, TEXT))
+	vbox.add_child(_make_label("(Declines automatically in %d seconds)" % int(UNDO_PROMPT_TIME), 14, TEXT_DIM))
+	vbox.add_child(_make_button("Allow", func(): _answer_undo(true, target)))
+	vbox.add_child(_make_button("Decline", func(): _answer_undo(false, target)))
+	queue_redraw()
+
+
+func _clear_prompt() -> void:
+	if _prompt_layer != null:
+		_prompt_layer.queue_free()
+		_prompt_layer = null
+
+
 func _settle_round(won: bool) -> void:
 	if _round_settled:
 		return
 	_round_settled = true
-	_last_reward = run.settle_round(engine, GameConfig.player_color, _round_enemy_material, won)
+	_last_reward = run.settle_round(engine, GameConfig.player_color, _enemy_material[GameConfig.player_color], won)
+
+
+## Multiplayer version: pays out every run this machine owns (both in hot-seat, just
+## yours online) and updates the score. winner is a colour, or 0 for a draw.
+func _settle_multiplayer(winner: int) -> void:
+	if _round_settled:
+		return
+	_round_settled = true
+	_result = {"winner": winner}
+	for color in _owned_colors():
+		var lost := winner != 0 and color != winner
+		_rewards[color] = _run_of(color).settle_round(engine, color, _enemy_material[color], color == winner, lost)
+	_last_reward = _rewards.get(GameConfig.player_color, {})
+	if winner != 0:
+		var first_won := winner == (_p1_color if _is_local() else GameConfig.player_color)
+		_score[0 if first_won else 1] += 1
 
 
 func _check_game_state() -> void:
 	if not _is_game_over():
 		_clear_game_over()
 		return
-	if _game_over_layer != null or _defeat_pending:
+	if _game_over_layer != null or _defeat_pending or _awaiting_mate_verdict:
 		return
 
+	if _is_local():
+		_check_state_local()
+	elif _is_online():
+		_check_state_online()
+	else:
+		_check_state_single()
+
+
+func _check_state_single() -> void:
 	if _status == ChessEngine.Status.STALEMATE:
 		_settle_round(false)
 		_show_draw_menu()
 	elif engine.turn == GameConfig.player_color:
 		if run.use_extra_life():
-			_second_wind()
+			_second_wind(GameConfig.player_color)
 			return
 		_settle_round(false)
 		_show_lose_menu()
@@ -631,13 +1007,63 @@ func _check_game_state() -> void:
 		_show_win_menu()
 
 
+func _check_state_local() -> void:
+	if _status == ChessEngine.Status.STALEMATE:
+		_settle_multiplayer(0)
+		_show_draw_menu()
+		return
+	var loser := engine.turn   # the side to move is the one that's mated
+	if _run_of(loser).use_extra_life() != "":
+		_second_wind(loser)
+		return
+	_settle_multiplayer(-loser)
+	_show_local_result_menu(-loser)
+
+
+## Both machines see the same checkmate. Only the mated player knows whether they own a
+## Second Wind, so they decide and tell the winner, who waits for that verdict.
+func _check_state_online() -> void:
+	if _status == ChessEngine.Status.STALEMATE:
+		_settle_multiplayer(0)
+		_show_draw_menu()
+		return
+
+	var loser := engine.turn
+	if loser == GameConfig.player_color:
+		if run.use_extra_life() != "":
+			_second_wind(GameConfig.player_color)
+			NetworkManager.send_mate_verdict(true, engine.history.size())
+			return
+		NetworkManager.send_mate_verdict(false, engine.history.size())
+		_settle_multiplayer(-loser)
+		_show_lose_menu(false, "You lose", "Your opponent checkmated you.")
+	else:
+		_awaiting_mate_verdict = true
+		queue_redraw()
+
+
+func _on_mate_verdict(used_life: bool, history_size: int) -> void:
+	if not _awaiting_mate_verdict:
+		return
+	_awaiting_mate_verdict = false
+	if used_life:
+		while engine.history.size() > history_size:
+			engine.undo()
+		_toast("Opponent used a Second Wind!")
+		_reset_view_state()
+	else:
+		_settle_multiplayer(GameConfig.player_color)
+		_show_win_menu()
+
+
 ## Consumes a Second Wind: rewinds the last couple of moves instead of losing.
-func _second_wind() -> void:
+## `color` is the player who was about to lose.
+func _second_wind(color: int) -> void:
 	var plies := 0
 	while plies < SECOND_WIND_PLIES and not engine.history.is_empty():
 		engine.undo()
 		plies += 1
-	while engine.turn != GameConfig.player_color and not engine.history.is_empty():
+	while engine.turn != color and not engine.history.is_empty():
 		engine.undo()
 	_toast("Second Wind! The board rewinds.")
 	_reset_view_state()
@@ -659,8 +1085,14 @@ func _on_lose_continue() -> void:
 
 func _open_shop() -> void:
 	_clear_game_over()
+	var shop_run := run
+	var shop_reward: Dictionary = _last_reward
+	if _is_local():
+		var loser := -int(_result.get("winner", 0))   # the loser shops, same as single player
+		shop_run = _run_of(loser)
+		shop_reward = _rewards.get(loser, {})
 	_shop = ShopScreen.new()
-	_shop.setup(run, _last_reward)
+	_shop.setup(shop_run, shop_reward)
 	_shop.next_round_requested.connect(_on_shop_closed)
 	add_child(_shop)
 
@@ -669,7 +1101,12 @@ func _on_shop_closed() -> void:
 	if _shop != null:
 		_shop.queue_free()
 		_shop = null
-	run.advance_round(false)
+	if _is_local():
+		var winner := int(_result.get("winner", 0))
+		_run_of(winner).advance_round(true)    # the loser earns an extra queen
+		_run_of(-winner).advance_round(false)
+	else:
+		run.advance_round(false)
 	_start_round()
 
 
@@ -677,6 +1114,9 @@ func _leave_to_menu() -> void:
 	if _leaving:
 		return
 	_leaving = true
+	if _is_online():
+		NetworkManager.close()
+	_clear_prompt()
 	_clear_game_over()
 
 	var layer := CanvasLayer.new()
@@ -694,9 +1134,8 @@ func _leave_to_menu() -> void:
 	get_tree().change_scene_to_file(MAIN_MENU_SCENE_PATH)
 
 
-# =============================================================================
 # Game-over menus
-# =============================================================================
+
 
 func _show_win_menu() -> void:
 	var vbox := _open_game_over_menu("Checkmate!", "You defeated the opponent.")
@@ -713,9 +1152,10 @@ func _show_draw_menu() -> void:
 	vbox.add_child(_make_button("Quit to Menu", _leave_to_menu))
 
 
-## Defeat: screen shake + red flash, then the menu slams in over falling pieces,
-## with a heartbeat that slows down as the countdown runs out.
-func _show_lose_menu() -> void:
+## Defeat: screen shake + red flash, then the menu slams in over falling pieces.
+## Single player adds a heartbeat that slows down as the countdown runs out; the
+## multiplayer modes skip the countdown (it would drop your opponent's connection).
+func _show_lose_menu(countdown: bool = true, title_text: String = "You lose", subtitle: String = "") -> void:
 	_defeat_pending = true
 	_play_defeat_impact()
 
@@ -725,29 +1165,67 @@ func _show_lose_menu() -> void:
 		return
 	_defeat_pending = false
 
-	var vbox := _open_game_over_menu("You lose", "", true)
+	var vbox := _open_game_over_menu(title_text, subtitle, true)
 
-	_heart_piece = TextureRect.new()
-	_heart_piece.texture = piece_textures[WHITE_KING_CODE]
-	_heart_piece.expand_mode = TextureRect.EXPAND_IGNORE_SIZE
-	_heart_piece.stretch_mode = TextureRect.STRETCH_KEEP_ASPECT_CENTERED
-	_heart_piece.texture_filter = CanvasItem.TEXTURE_FILTER_NEAREST
-	_heart_piece.custom_minimum_size = Vector2(120, 120)
-	_heart_piece.pivot_offset = Vector2(60, 60)
-	vbox.add_child(_heart_piece)
+	if countdown:
+		_heart_piece = TextureRect.new()
+		_heart_piece.texture = piece_textures[WHITE_KING_CODE]
+		_heart_piece.expand_mode = TextureRect.EXPAND_IGNORE_SIZE
+		_heart_piece.stretch_mode = TextureRect.STRETCH_KEEP_ASPECT_CENTERED
+		_heart_piece.texture_filter = CanvasItem.TEXTURE_FILTER_NEAREST
+		_heart_piece.custom_minimum_size = Vector2(120, 120)
+		_heart_piece.pivot_offset = Vector2(60, 60)
+		vbox.add_child(_heart_piece)
 
-	_timer_label = _make_label(str(int(LOSE_COUNTDOWN)), 48, TEXT)
-	_timer_label.pivot_offset = Vector2(30, 28)
-	vbox.add_child(_timer_label)
+		_timer_label = _make_label(str(int(LOSE_COUNTDOWN)), 48, TEXT)
+		_timer_label.pivot_offset = Vector2(30, 28)
+		vbox.add_child(_timer_label)
 
 	_add_reward_label(vbox)
 	vbox.add_child(_make_button("Continue Playing", _on_lose_continue))
 	vbox.add_child(_make_button("Quit", _leave_to_menu))
 
-	_lose_timer = LOSE_COUNTDOWN
-	_last_tick = int(LOSE_COUNTDOWN)
-	_beat_phase = 0.0
-	_crack_applied = false
+	if countdown:
+		_lose_timer = LOSE_COUNTDOWN
+		_last_tick = int(LOSE_COUNTDOWN)
+		_beat_phase = 0.0
+		_crack_applied = false
+
+
+## Hot-seat checkmate: same drama as a defeat, then the LOSER visits the shop.
+func _show_local_result_menu(winner: int) -> void:
+	var loser := -winner
+	_defeat_pending = true
+	_play_defeat_impact()
+
+	var token := _round_token
+	await get_tree().create_timer(DEFEAT_MENU_DELAY).timeout
+	if token != _round_token or _leaving or not is_inside_tree():
+		return
+	_defeat_pending = false
+
+	var vbox := _open_game_over_menu("Checkmate!", "%s wins." % _player_label(winner), true)
+	_add_reward_label(vbox)
+	vbox.add_child(_make_label("%s will gain an extra Queen." % _player_label(loser), 16, MOVE_CAPTURE))
+	vbox.add_child(_make_button("%s: Visit Shop" % _player_label(loser), _open_shop))
+	vbox.add_child(_make_button("Quit to Menu", _leave_to_menu))
+
+
+func _on_opponent_left() -> void:
+	if _leaving:
+		return
+	_round_token += 1   # cancels any pending defeat animation
+	_awaiting_setup = false
+	_awaiting_mate_verdict = false
+	_pending_undo = false
+	_clear_prompt()
+	if _shop != null:
+		_shop.queue_free()
+		_shop = null
+	_clear_game_over()
+	var vbox := _open_game_over_menu("Opponent left", "The connection was closed.")
+	vbox.add_child(_make_button("Quit to Menu", _leave_to_menu))
+	queue_redraw()
 
 
 func _play_defeat_impact() -> void:
@@ -768,6 +1246,12 @@ func _play_defeat_impact() -> void:
 
 
 func _add_reward_label(vbox: VBoxContainer) -> void:
+	if _is_local():
+		for color in [ChessEngine.WHITE, ChessEngine.BLACK]:
+			var earned := int(_rewards.get(color, {}).get("total", 0))
+			if earned > 0:
+				vbox.add_child(_make_label("%s earned $%d" % [_player_label(color), earned], 20, GOLD))
+		return
 	var total := int(_last_reward.get("total", 0))
 	if total > 0:
 		vbox.add_child(_make_label("Earned $%d" % total, 20, GOLD))
