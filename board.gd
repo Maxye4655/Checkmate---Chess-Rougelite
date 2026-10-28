@@ -121,6 +121,9 @@ var _move_anim := Anim.new()
 var _move_from := Vector2i.ZERO
 var _move_to := Vector2i.ZERO
 var _move_code := 0
+var _rook_from := Vector2i(-1, -1)   # castling: the rook slides alongside the king
+var _rook_to := Vector2i(-1, -1)
+var _rook_code := 0
 var _click_anim := Anim.new()
 var _click_square := Vector2i(-1, -1)
 var _reset_anim := Anim.new()
@@ -342,7 +345,8 @@ func _draw_highlights() -> void:
 
 	for to in legal_for_selected:
 		var center := _square_center(to)
-		if engine.piece_at(to) == ChessEngine.Type.EMPTY:
+		var is_capture: bool = engine.piece_at(to) != ChessEngine.Type.EMPTY or engine.is_en_passant(selected, to)
+		if not is_capture:
 			draw_circle(center, TILE_SIZE * 0.15, MOVE_DOT)
 		else:
 			draw_arc(center, TILE_SIZE * 0.40, 0.0, TAU, 40, MOVE_CAPTURE, 7.0, true)
@@ -375,7 +379,7 @@ func _draw_pieces() -> void:
 	for r in range(8):
 		for c in range(8):
 			var square := Vector2i(c, r)
-			if moving and square == _move_to:
+			if moving and (square == _move_to or square == _rook_to):
 				continue
 			var code: int = engine.board[r][c]
 			if code == ChessEngine.Type.EMPTY:
@@ -385,6 +389,9 @@ func _draw_pieces() -> void:
 	if moving:
 		var pos := _square_center(_move_from).lerp(_square_center(_move_to), _ease_out(_move_anim.t))
 		_draw_piece(_move_code, pos, reset_scale)
+		if _rook_from != Vector2i(-1, -1):
+			var rook_pos := _square_center(_rook_from).lerp(_square_center(_rook_to), _ease_out(_move_anim.t))
+			_draw_piece(_rook_code, rook_pos, reset_scale)
 
 
 func _draw_piece(code: int, center: Vector2, scale_mult: float) -> void:
@@ -757,10 +764,18 @@ func _reset_view_state() -> void:
 
 
 func _make_move(from: Vector2i, to: Vector2i) -> void:
+	var castling := engine.is_castling(from, to)   # must be asked before the move is played
 	engine.make_move(from, to)
 	_move_from = from
 	_move_to = to
 	_move_code = engine.piece_at(to)
+	_rook_from = Vector2i(-1, -1)
+	_rook_to = Vector2i(-1, -1)
+	if castling:
+		var kingside := to.x > from.x
+		_rook_from = Vector2i(7 if kingside else 0, from.y)
+		_rook_to = Vector2i(5 if kingside else 3, from.y)
+		_rook_code = engine.piece_at(_rook_to)
 	_move_anim.start(MOVE_ANIM_TIME)
 	_click_anim.stop()
 	_refresh_status()
@@ -886,7 +901,7 @@ func _request_online_undo() -> void:
 
 func _on_undo_requested(target: int, history_size: int) -> void:
 	# Decline automatically if our boards no longer line up (a move crossed the request).
-	var stale := history_size != engine.history.size() or target < 0 or target >= history_size
+	var stale: bool = history_size != engine.history.size() or target < 0 or target >= history_size
 	if stale or _pending_undo or _awaiting_setup or _awaiting_mate_verdict \
 			or _is_game_over() or _shop != null:
 		NetworkManager.send_undo_answer(false, target)
@@ -969,11 +984,11 @@ func _settle_multiplayer(winner: int) -> void:
 	_round_settled = true
 	_result = {"winner": winner}
 	for color in _owned_colors():
-		var lost := winner != 0 and color != winner
+		var lost: bool = winner != 0 and color != winner
 		_rewards[color] = _run_of(color).settle_round(engine, color, _enemy_material[color], color == winner, lost)
 	_last_reward = _rewards.get(GameConfig.player_color, {})
 	if winner != 0:
-		var first_won := winner == (_p1_color if _is_local() else GameConfig.player_color)
+		var first_won: bool = winner == (_p1_color if _is_local() else GameConfig.player_color)
 		_score[0 if first_won else 1] += 1
 
 
@@ -1134,8 +1149,9 @@ func _leave_to_menu() -> void:
 	get_tree().change_scene_to_file(MAIN_MENU_SCENE_PATH)
 
 
+# =============================================================================
 # Game-over menus
-
+# =============================================================================
 
 func _show_win_menu() -> void:
 	var vbox := _open_game_over_menu("Checkmate!", "You defeated the opponent.")
