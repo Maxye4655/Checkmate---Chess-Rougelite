@@ -39,8 +39,9 @@ func _exit_tree() -> void:
 		_upnp_thread.wait_to_finish()
 
 
-
+# =============================================================================
 # Connecting
+# =============================================================================
 
 func host_game() -> Error:
 	close()
@@ -140,7 +141,9 @@ func _start_match(my_color: int) -> void:
 	get_tree().change_scene_to_file("res://board.tscn")
 
 
+# =============================================================================
 # Delivery to the board scene
+# =============================================================================
 
 func set_board_ready(value: bool) -> void:
 	_board_ready = value
@@ -159,9 +162,9 @@ func _dispatch(signal_name: StringName, args: Array) -> void:
 		_inbox.append([signal_name, args])
 
 
-
+# =============================================================================
 # Messages (send_* are what the board calls; _receive_* run on the other machine)
-
+# =============================================================================
 
 func send_move(from: Vector2i, to: Vector2i) -> void:
 	if _peer != null:
