@@ -6,20 +6,141 @@ const BOARD_SCENE_PATH := "res://board.tscn"
 @onready var play_button: Button = $CenterContainer/MenuBox/PlayButton
 
 var _leaving := false
+var _ip_edit: LineEdit
+var _status_label: Label
+var _cancel_button: Button
+var _join_row: HBoxContainer
+var _lan_ip := ""
 
 
 func _ready() -> void:
+	var box := play_button.get_parent()
+
+	# One horizontal row of buttons, like Balatro. The row takes the Play button's place in
+	# MenuBox, so it sits wherever that button was (directly under the title).
+	var row := HBoxContainer.new()
+	row.alignment = BoxContainer.ALIGNMENT_CENTER
+	row.add_theme_constant_override("separation", 20)
+	box.add_child(row)
+	box.move_child(row, play_button.get_index())
+	play_button.reparent(row, false)
+
+	play_button.text = "Single Player"
 	_style_button(play_button)
 	play_button.pressed.connect(_on_play_pressed)
+	_add_button(row, "Local 2-Player", _on_local_pressed)
+	_add_button(row, "Host Online", _on_host_pressed)
+	_add_button(row, "Join Online", _on_join_pressed)
+
+	# Second row, only shown after pressing "Join Online".
+	_join_row = HBoxContainer.new()
+	_join_row.alignment = BoxContainer.ALIGNMENT_CENTER
+	_join_row.add_theme_constant_override("separation", 12)
+	_join_row.hide()
+	box.add_child(_join_row)
+
+	_ip_edit = LineEdit.new()
+	_ip_edit.placeholder_text = "Host IP address"
+	_ip_edit.alignment = HORIZONTAL_ALIGNMENT_CENTER
+	_ip_edit.custom_minimum_size = Vector2(300, 56)
+	_ip_edit.add_theme_font_size_override("font_size", 22)
+	_ip_edit.text_submitted.connect(func(_text): _on_connect_pressed())
+	_join_row.add_child(_ip_edit)
+	_add_button(_join_row, "Connect", _on_connect_pressed)
+
+	_status_label = Label.new()
+	_status_label.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
+	box.add_child(_status_label)
+
+	_cancel_button = _add_button(box, "Cancel", _on_cancel_pressed)
+	_cancel_button.size_flags_horizontal = Control.SIZE_SHRINK_CENTER
+	_cancel_button.hide()
+
+	NetworkManager.connection_failed.connect(_on_connection_failed)
+	NetworkManager.upnp_finished.connect(_on_upnp_finished)
+
 	play_button.grab_focus()
 
 
+func _add_button(parent: Node, text: String, callback: Callable) -> Button:
+	var button := Button.new()
+	button.text = text
+	_style_button(button)
+	button.pressed.connect(callback)
+	parent.add_child(button)
+	return button
+
+
+# --- Mode buttons
+
 func _on_play_pressed() -> void:
+	NetworkManager.close()
+	GameConfig.mode = GameConfig.Mode.SINGLE
+	GameConfig.player_color = ChessEngine.WHITE
+	_go_to_board()
+
+
+func _on_local_pressed() -> void:
+	NetworkManager.close()
+	GameConfig.mode = GameConfig.Mode.LOCAL
+	GameConfig.player_color = ChessEngine.WHITE
+	_go_to_board()
+
+
+func _on_host_pressed() -> void:
+	if NetworkManager.host_game() != OK:
+		_status_label.text = "Could not host (is port %d already in use?)" % NetworkManager.PORT
+		return
+	_lan_ip = NetworkManager.get_local_ip()
+	_status_label.text = "Waiting for an opponent...\nSame network: %s\nOpening the port for internet play..." % _lan_ip
+	_cancel_button.show()
+	NetworkManager.try_upnp()
+
+
+func _on_join_pressed() -> void:
+	_join_row.visible = not _join_row.visible
+	if _join_row.visible:
+		_ip_edit.grab_focus()
+
+
+func _on_connect_pressed() -> void:
+	var address := _ip_edit.text.strip_edges()
+	if address.is_empty():
+		address = "127.0.0.1"
+	if NetworkManager.join_game(address) != OK:
+		_status_label.text = "Could not start the connection."
+		return
+	_status_label.text = "Connecting to %s..." % address
+	_cancel_button.show()
+
+
+func _on_cancel_pressed() -> void:
+	NetworkManager.close()
+	_status_label.text = ""
+	_cancel_button.hide()
+	_join_row.hide()
+
+
+# --- Network feedback (the match itself starts from NetworkManager)
+
+func _on_connection_failed() -> void:
+	_status_label.text = "Could not connect."
+	_cancel_button.hide()
+
+
+func _on_upnp_finished(success: bool, external_ip: String) -> void:
+	if not _cancel_button.visible:
+		return   # no longer hosting
+	if success:
+		_status_label.text = "Waiting for an opponent...\nSame network: %s\nInternet: %s" % [_lan_ip, external_ip]
+	else:
+		_status_label.text = "Waiting for an opponent...\nSame network: %s\nInternet play: forward UDP port %d on your router." % [_lan_ip, NetworkManager.PORT]
+
+
+func _go_to_board() -> void:
 	if _leaving:
 		return
 	_leaving = true
-
-	GameConfig.player_color = ChessEngine.WHITE
 
 	var fade := ColorRect.new()
 	fade.set_anchors_preset(Control.PRESET_FULL_RECT)
@@ -34,7 +155,7 @@ func _on_play_pressed() -> void:
 
 
 func _style_button(button: Button) -> void:
-	button.custom_minimum_size = Vector2(300, 84)
+	button.custom_minimum_size = Vector2(210, 80)
 
 	var normal := StyleBoxFlat.new()
 	normal.bg_color = Color("3d5662ff")
@@ -65,4 +186,4 @@ func _style_button(button: Button) -> void:
 	button.add_theme_color_override("font_hover_color", Color("212e35ff"))
 	button.add_theme_color_override("font_pressed_color", Color("96a2a8ff"))
 	button.add_theme_color_override("font_focus_color", Color("ffffffff"))
-	button.add_theme_font_size_override("font_size", 28)
+	button.add_theme_font_size_override("font_size", 24)
