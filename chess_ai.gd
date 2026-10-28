@@ -100,6 +100,11 @@ var _king_sq := {}
 var _hash := 0
 var _z_piece := []
 var _z_side := 0
+var _z_castle := []        # one key per castling-rights bitmask (0..15)
+var _z_ep := []            # one key per en passant file
+
+var _castle := 0           # castling rights, same bitmask as ChessEngine.castle_rights
+var _ep := -1              # en passant target square (0..63), or -1
 
 var _deadline := 0
 var _stop := false
@@ -300,7 +305,6 @@ func _board_is_quiet(move: int) -> bool:
 	return _board[move & 63] == EMPTY
 
 
-
 func _gen_pseudo(side: int, captures_only: bool) -> Array:
 	var moves := []
 	for sq in range(64):
@@ -320,9 +324,9 @@ func _gen_pseudo(side: int, captures_only: bool) -> Array:
 					elif signi(target) != side:
 						moves.append(sq * 64 + to)
 			BISHOP:
-				_slide(sq, side, 4, 6, captures_only, moves)
+				_slide(sq, side, 4, 8, captures_only, moves)   # all four diagonals
 			ROOK:
-				_slide(sq, side, 0, 2, captures_only, moves)
+				_slide(sq, side, 0, 4, captures_only, moves)   # all four straight lines
 			QUEEN:
 				_slide(sq, side, 0, 8, captures_only, moves)
 			KING:
@@ -333,7 +337,30 @@ func _gen_pseudo(side: int, captures_only: bool) -> Array:
 							moves.append(sq * 64 + to)
 					elif signi(target) != side:
 						moves.append(sq * 64 + to)
+				if not captures_only:
+					_castle_moves(sq, side, moves)
 	return moves
+
+
+## Castling: the king moves two squares (the rook is moved in _make). Same rules as
+## ChessEngine; landing on an attacked square is rejected by _gen_legal.
+func _castle_moves(sq: int, side: int, moves: Array) -> void:
+	var king_bit := 1 if side == WHITE else 4
+	var queen_bit := 2 if side == WHITE else 8
+	if (_castle & (king_bit | queen_bit)) == 0:
+		return
+	var home := 60 if side == WHITE else 4   # e1 / e8
+	if sq != home or _is_attacked(sq, -side):
+		return
+	var rook := ROOK * side
+	if (_castle & king_bit) != 0 and _board[sq + 3] == rook \
+			and _board[sq + 1] == EMPTY and _board[sq + 2] == EMPTY \
+			and not _is_attacked(sq + 1, -side):
+		moves.append(sq * 64 + sq + 2)
+	if (_castle & queen_bit) != 0 and _board[sq - 4] == rook \
+			and _board[sq - 1] == EMPTY and _board[sq - 2] == EMPTY and _board[sq - 3] == EMPTY \
+			and not _is_attacked(sq - 1, -side):
+		moves.append(sq * 64 + sq - 2)
 
 
 func _slide(sq: int, side: int, d0: int, d1: int, captures_only: bool, moves: Array) -> void:
@@ -379,6 +406,8 @@ func _pawn_moves(sq: int, side: int, captures_only: bool, moves: Array) -> void:
 				var target := _board[to]
 				if target != EMPTY and signi(target) != side:
 					moves.append(sq * 64 + to)
+				elif to == _ep and target == EMPTY and _board[r * 8 + tc] == -PAWN * side:
+					moves.append(sq * 64 + to)   # en passant
 
 
 func _gen_captures(side: int) -> Array:
@@ -400,12 +429,34 @@ func _make(move: int) -> int:
 	var to := move & 63
 	var moved := _board[from]
 	var captured := _board[to]
+	var prev_castle := _castle
+	var prev_ep := _ep
+	var t := absi(moved)
 	_board[from] = EMPTY
 	var placed := moved
-	if moved == PAWN or moved == -PAWN:
+	var new_ep := -1
+
+	if t == PAWN:
 		var to_row := to >> 3
 		if to_row == 0 or to_row == 7:
 			placed = QUEEN * signi(moved)
+		elif captured == EMPTY and (to & 7) != (from & 7):
+			# en passant: remove the pawn beside the start square
+			var cap_sq := (from & ~7) + (to & 7)
+			_hash ^= _z_piece[_piece_index(_board[cap_sq])][cap_sq]
+			_board[cap_sq] = EMPTY
+		elif absi(to - from) == 16:
+			new_ep = (from + to) >> 1
+	elif t == KING and absi(to - from) == 2:
+		# castling: move the rook too
+		var rook_from := from + 3 if to > from else from - 4
+		var rook_to := from + 1 if to > from else from - 1
+		var rook := _board[rook_from]
+		_board[rook_from] = EMPTY
+		_board[rook_to] = rook
+		_hash ^= _z_piece[_piece_index(rook)][rook_from]
+		_hash ^= _z_piece[_piece_index(rook)][rook_to]
+
 	_board[to] = placed
 
 	_hash ^= _z_piece[_piece_index(moved)][from]
@@ -419,8 +470,21 @@ func _make(move: int) -> int:
 	elif moved == -KING:
 		_king_sq[BLACK] = to
 
+	# Castling rights: lost when the king moves or a rook moves from / is taken on its corner.
+	_castle &= ~(_corner_bits(from) | _corner_bits(to))
+	if moved == KING:
+		_castle &= ~3
+	elif moved == -KING:
+		_castle &= ~12
+	_hash ^= _z_castle[prev_castle] ^ _z_castle[_castle]
+	if prev_ep >= 0:
+		_hash ^= _z_ep[prev_ep & 7]
+	if new_ep >= 0:
+		_hash ^= _z_ep[new_ep & 7]
+	_ep = new_ep
+
 	_side = -_side
-	return (moved + 8) | ((captured + 8) << 8)
+	return (moved + 8) | ((captured + 8) << 8) | (prev_castle << 16) | ((prev_ep + 1) << 20)
 
 
 func _unmake(move: int, undo: int) -> void:
@@ -428,7 +492,10 @@ func _unmake(move: int, undo: int) -> void:
 	var to := move & 63
 	var moved := (undo & 0xFF) - 8
 	var captured := ((undo >> 8) & 0xFF) - 8
+	var prev_castle := (undo >> 16) & 0xF
+	var prev_ep := ((undo >> 20) & 0x7F) - 1
 	var placed := _board[to]
+	var t := absi(moved)
 
 	_board[from] = moved
 	_board[to] = captured
@@ -439,12 +506,50 @@ func _unmake(move: int, undo: int) -> void:
 	_hash ^= _z_piece[_piece_index(placed)][to]
 	_hash ^= _z_side
 
+	if t == PAWN and captured == EMPTY and (to & 7) != (from & 7):
+		# undo en passant: put the captured pawn back beside the start square
+		var cap_sq := (from & ~7) + (to & 7)
+		var cap_piece := -PAWN * signi(moved)
+		_board[cap_sq] = cap_piece
+		_hash ^= _z_piece[_piece_index(cap_piece)][cap_sq]
+	elif t == KING and absi(to - from) == 2:
+		# undo castling: put the rook back
+		var rook_from := from + 3 if to > from else from - 4
+		var rook_to := from + 1 if to > from else from - 1
+		var rook := _board[rook_to]
+		_board[rook_to] = EMPTY
+		_board[rook_from] = rook
+		_hash ^= _z_piece[_piece_index(rook)][rook_from]
+		_hash ^= _z_piece[_piece_index(rook)][rook_to]
+
 	if moved == KING:
 		_king_sq[WHITE] = from
 	elif moved == -KING:
 		_king_sq[BLACK] = from
 
+	_hash ^= _z_castle[_castle] ^ _z_castle[prev_castle]
+	if _ep >= 0:
+		_hash ^= _z_ep[_ep & 7]
+	if prev_ep >= 0:
+		_hash ^= _z_ep[prev_ep & 7]
+	_castle = prev_castle
+	_ep = prev_ep
+
 	_side = -_side
+
+
+## Castling-right bits lost when something moves from or to this square.
+func _corner_bits(sq: int) -> int:
+	match sq:
+		63:
+			return 1    # h1: White king side
+		56:
+			return 2    # a1: White queen side
+		7:
+			return 4    # h8: Black king side
+		0:
+			return 8    # a8: Black queen side
+	return 0
 
 
 func _in_check(color: int) -> bool:
@@ -593,9 +698,15 @@ func _pst(type: int, sq: int, white: bool) -> int:
 	return 0
 
 
+## Scores every move once, then sorts. (Sorting with a comparator that rescored both
+## moves on every comparison was the search's biggest cost.)
 func _order(moves: Array, tt_move: int, ply: int) -> void:
-	moves.sort_custom(func(a: int, b: int) -> bool:
-		return _score_move(a, tt_move, ply) > _score_move(b, tt_move, ply))
+	var scored := []
+	for m in moves:
+		scored.append([_score_move(m, tt_move, ply), m])
+	scored.sort_custom(func(x: Array, y: Array) -> bool: return x[0] > y[0])
+	for i in range(moves.size()):
+		moves[i] = scored[i][1]
 
 
 func _score_move(move: int, tt_move: int, ply: int) -> int:
@@ -633,6 +744,8 @@ func _load(engine: ChessEngine) -> void:
 			elif code == -KING:
 				_king_sq[BLACK] = r * 8 + c
 	_side = engine.turn
+	_castle = engine.castle_rights
+	_ep = engine.ep_square.y * 8 + engine.ep_square.x if engine.ep_square.x >= 0 else -1
 	_hash = _compute_hash()
 
 
@@ -644,6 +757,9 @@ func _compute_hash() -> int:
 			h ^= _z_piece[_piece_index(code)][sq]
 	if _side == BLACK:
 		h ^= _z_side
+	h ^= _z_castle[_castle]
+	if _ep >= 0:
+		h ^= _z_ep[_ep & 7]
 	return h
 
 func _piece_index(code: int) -> int:
@@ -696,3 +812,9 @@ func _init_zobrist() -> void:
 			row.append(rng.randi())
 		_z_piece.append(row)
 	_z_side = rng.randi()
+	_z_castle = []
+	for i in range(16):
+		_z_castle.append(rng.randi())
+	_z_ep = []
+	for i in range(8):
+		_z_ep.append(rng.randi())
