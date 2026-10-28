@@ -219,9 +219,8 @@ func advance_round(won: bool) -> void:
 	round_number += 1
 
 
-## Call right after engine.reset(): refills per-round resources and applies every
-## upgrade (and the opponent's extra queens) to the fresh board.
-func begin_round(engine: ChessEngine, player_color: int) -> void:
+## Refills everything that resets each round (undos, lives, bounty counters...).
+func refill_round_resources() -> void:
 	undos_left = undos_per_round()
 	undos_used = 0
 	hints_left = hints_per_round()
@@ -230,28 +229,73 @@ func begin_round(engine: ChessEngine, player_color: int) -> void:
 	round_captures = 0
 	round_checks = 0
 	revolution_used = false
+
+
+## Single player: call right after engine.reset(). Refills per-round resources and
+## applies every upgrade (and the opponent's extra queens) to the fresh board.
+func begin_round(engine: ChessEngine, player_color: int) -> void:
+	refill_round_resources()
 	_apply_loadout(engine, player_color)
 
 
 func _apply_loadout(engine: ChessEngine, player_color: int) -> void:
 	var board = engine.board
+	_step_promotions(board, player_color)
+	_step_remove_enemy_pawns(board, player_color)
+	_step_enemy_queens(board, player_color)
+	_step_queenbane(board, player_color)
 
+
+## Multiplayer: applies BOTH players' loadouts to one fresh board. Each step runs for
+## both players before the next step starts, so neither side gets an ordering edge.
+## Only ONE machine should call this (the host); it uses random shuffles.
+static func apply_versus_loadouts(
+		engine: ChessEngine,
+		run_a: RunState, color_a: int,
+		run_b: RunState, color_b: int) -> void:
+	var board = engine.board
+	run_a._step_promotions(board, color_a)
+	run_b._step_promotions(board, color_b)
+	run_a._step_remove_enemy_pawns(board, color_a)
+	run_b._step_remove_enemy_pawns(board, color_b)
+	run_a._step_enemy_queens(board, color_a)
+	run_b._step_enemy_queens(board, color_b)
+	run_a._step_queenbane(board, color_a)
+	run_b._step_queenbane(board, color_b)
+
+
+## The part of a run the opponent needs in order to build the shared board.
+func export_loadout() -> Dictionary:
+	return {"owned": owned.duplicate(), "enemy_queens": enemy_queens}
+
+
+## Rebuilds a stand-in RunState from a received loadout. Unknown items are ignored and
+## counts are clamped, so a bad message can't crash the host.
+static func from_loadout(data: Dictionary) -> RunState:
+	var r := RunState.new()
+	var items: Dictionary = data.get("owned", {})
+	for id in items:
+		if ShopItems.ITEMS.has(id):
+			var max_count := int(ShopItems.ITEMS[id].get("max", 1))
+			r.owned[id] = clampi(int(items[id]), 0, max_count)
+	r.enemy_queens = clampi(int(data.get("enemy_queens", 0)), 0, 64)
+	return r
+
+
+# 1) Your promotions (best pieces first)
+func _step_promotions(board, player_color: int) -> void:
 	var is_my_pawn := func(code: int) -> bool:
 		return absi(code) == PAWN and ChessEngine.color_of(code) == player_color
-	var is_enemy_pawn := func(code: int) -> bool:
-		return absi(code) == PAWN and ChessEngine.color_of(code) != player_color
-	var is_enemy_queen := func(code: int) -> bool:
-		return absi(code) == QUEEN and ChessEngine.color_of(code) != player_color
-	# Any enemy piece except the king and existing queens (the engine has no castling).
-	var is_enemy_replaceable := func(code: int) -> bool:
-		var t := absi(code)
-		return ChessEngine.color_of(code) != player_color and t != QUEEN and t != KING
 
-	# 1) Player promotions (best pieces first)
 	var promotions: Array[int] = []
 	for entry in _owned_of_kind("start_piece"):
+		var item: Dictionary = entry["item"]
+		# Items use "piece": 2 (one piece) or "pieces": [4, 4, 3] (several).
+		var pieces = item.get("pieces", item.get("piece", []))
+		if not (pieces is Array):
+			pieces = [pieces]
 		for i in range(int(entry["count"])):
-			for piece in entry["item"]["piece"]:
+			for piece in pieces:
 				promotions.append(int(piece))
 	promotions.sort()
 	promotions.reverse()
@@ -263,7 +307,12 @@ func _apply_loadout(engine: ChessEngine, player_color: int) -> void:
 			break
 		_replace(board, my_pawns.pop_back(), piece)
 
-	# 2) Enemy pawn removal
+
+# 2) Enemy pawn removal
+func _step_remove_enemy_pawns(board, player_color: int) -> void:
+	var is_enemy_pawn := func(code: int) -> bool:
+		return absi(code) == PAWN and ChessEngine.color_of(code) != player_color
+
 	var removals := _sum_kind("remove_enemy_pawn")
 	if removals > 0:
 		var enemy_pawns := _find_squares(board, is_enemy_pawn)
@@ -272,14 +321,27 @@ func _apply_loadout(engine: ChessEngine, player_color: int) -> void:
 			var sq: Vector2i = enemy_pawns[i]
 			board[sq.y][sq.x] = ChessEngine.Type.EMPTY
 
-	# 3) Opponent queens earned by your wins
+
+# 3) Opponent queens earned by your wins
+func _step_enemy_queens(board, player_color: int) -> void:
+	# Any enemy piece except the king and existing queens. (A rook that gets replaced
+	# simply can't castle any more: the engine checks a rook is really on its corner.)
+	var is_enemy_replaceable := func(code: int) -> bool:
+		var t := absi(code)
+		return ChessEngine.color_of(code) != player_color and t != QUEEN and t != KING
+
 	if enemy_queens > 0:
 		var candidates := _find_squares(board, is_enemy_replaceable)
 		candidates.shuffle()
 		for i in range(mini(enemy_queens, candidates.size())):
 			_replace(board, candidates[i], QUEEN)
 
-	# 4) Queenbane: knock enemy queens down to bishops (after step 3 so it can undo them)
+
+# 4) Queenbane: knock enemy queens down to bishops (after step 3 so it can undo them)
+func _step_queenbane(board, player_color: int) -> void:
+	var is_enemy_queen := func(code: int) -> bool:
+		return absi(code) == QUEEN and ChessEngine.color_of(code) != player_color
+
 	var downgrades := _sum_kind("downgrade_queen")
 	if downgrades > 0:
 		var queens := _find_squares(board, is_enemy_queen)
