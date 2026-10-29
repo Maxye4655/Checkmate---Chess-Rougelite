@@ -7,7 +7,7 @@
 
 #Checkmate
 
-A pixel-art, single-player (So far...) chess rougelike made in Godot 4.7.
+A pixel-art, single-player, local multiplayer and online multiplayer chess rouge-liye made in Godot 4.7.
 
 Play chess against a computer opponent. Win and the opponent gets stronger, Lose and you visit a shop to purchase upgrades for your next run. Complete challenges to unlock stronger shop items that stay unlocked between runs.
 
@@ -22,7 +22,7 @@ Play chess against a computer opponent. Win and the opponent gets stronger, Lose
 
 ### Itch.io
 
-You can play the full, web-ported version of the game at https://maxye4655.itch.io/checkmate-chess-rouge-like?secret=j7Q9weM5JuQXKkBqAZ9LFYKkSgE
+You can play the full, web-ported version of the game at https://maxye4655.itch.io/checkmate-chess-rougelike
 
 ## How to play
  

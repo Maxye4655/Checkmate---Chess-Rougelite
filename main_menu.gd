@@ -12,6 +12,12 @@ var _cancel_button: Button
 var _join_row: HBoxContainer
 var _lan_ip := ""
 
+const HOVER_LIFT := 4.0
+const HOVER_DURATION := 0.10
+const INDICATOR_COLOR := Color("e0b94e")
+
+var _button_tweens: Dictionary = {}
+var _focused_button: Button
 
 func _ready() -> void:
 	var box := play_button.get_parent()
@@ -156,34 +162,102 @@ func _go_to_board() -> void:
 
 func _style_button(button: Button) -> void:
 	button.custom_minimum_size = Vector2(210, 80)
-
-	var normal := StyleBoxFlat.new()
-	normal.bg_color = Color("3d5662ff")
-	normal.border_color = Color("648a9dff")
-	normal.set_border_width_all(2)
-	normal.set_corner_radius_all(6)
-	normal.content_margin_left = 24
-	normal.content_margin_right = 24
-	normal.content_margin_top = 10
-	normal.content_margin_bottom = 10
-
-	var hover := normal.duplicate()
-	hover.bg_color = Color("648a9dff")
-	hover.border_color = Color("ffffffff")
-
-	var pressed := normal.duplicate()
-	pressed.bg_color = Color("212e35ff")
-
-	var focus := StyleBoxFlat.new()
-	focus.bg_color = Color(0, 0, 0, 0)
-	focus.border_color = Color("ffffffff")
-
+	button.focus_mode = Control.FOCUS_ALL
+	button.mouse_filter = Control.MOUSE_FILTER_STOP
+	
+	var normal := _make_button_style(
+		"res://Assets/UI/button_normal.png"
+	)
+	var hover := _make_button_style(
+		"res://Assets/UI/button_hover.png"
+	)
+	var pressed := _make_button_style(
+		"res://Assets/UI/button_pressed.png"
+	)
+	
 	button.add_theme_stylebox_override("normal", normal)
 	button.add_theme_stylebox_override("hover", hover)
 	button.add_theme_stylebox_override("pressed", pressed)
-	button.add_theme_stylebox_override("focus", focus)
-	button.add_theme_color_override("font_color", Color("ffffffff"))
-	button.add_theme_color_override("font_hover_color", Color("212e35ff"))
-	button.add_theme_color_override("font_pressed_color", Color("96a2a8ff"))
-	button.add_theme_color_override("font_focus_color", Color("ffffffff"))
+	
+	button.add_theme_color_override(
+		"font_color", Color("f5ead0")
+	)
+	button.add_theme_color_override(
+		"font_hover_color", Color("ffffff")
+	)
+	button.add_theme_color_override(
+		"font_pressed_color", Color("e3b753ff")
+ 	)
+	button.add_theme_color_override(
+		"font_focus_color", Color("ffffff")
+	)
+	
 	button.add_theme_font_size_override("font_size", 24)
+	
+	# Hover Animation.
+	button.mouse_entered.connect(
+		func(): _animate_button(button, true)
+	)
+	button.mouse_exited.connect(
+		func(): _animate_button(button, false)
+	)
+
+func _make_button_style(path: String) -> StyleBoxTexture:
+	var style := StyleBoxTexture.new()
+	style.texture = load(path)
+	
+	style.texture_margin_left = 8
+	style.texture_margin_right = 8
+	style.texture_margin_top = 8
+	style.texture_margin_bottom = 8
+	
+	style.content_margin_left = 16
+	style.content_margin_right = 16
+	style.content_margin_bottom = 8
+	style.texture_margin_top = 8
+	
+	return style
+
+func _animate_button(button: Button, hovering: bool) -> void:
+	if _button_tweens.has(button):
+		var old_tween: Tween = _button_tweens[button]
+		if old_tween.is_valid():
+			old_tween.kill()
+	
+	var target_y := -HOVER_LIFT if hovering else 0.0
+	
+	var tween := create_tween()
+	_button_tweens[button] = tween
+	
+	tween.set_trans(Tween.TRANS_QUAD)
+	tween.set_ease(Tween.EASE_OUT)
+	tween.tween_property(
+		button, "position:y", target_y, HOVER_DURATION
+	)
+	
+	if not hovering:
+		tween.tween_callback(
+			func(): _button_tweens.erase(button)
+		)
+
+func _draw() -> void:
+	if not is_instance_valid(_focused_button):
+		return
+	
+	if not _focused_button.is_visible_in_tree():
+		return
+	
+	var rect := _focused_button.get_global_rect()
+	var center := Vector2(
+		rect.position.x - 12,
+		rect.position.y + rect.size.y / 2.0
+	)
+	
+	var points := PackedVector2Array([
+		center + Vector2(0, -5),
+		center + Vector2(5, 0),
+		center + Vector2(0, 5),
+		center + Vector2(-5, 0)
+	])
+	
+	draw_colored_polygon(points, INDICATOR_COLOR)

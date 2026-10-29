@@ -3,7 +3,6 @@
 [ext_resource type="Script" uid="uid://byldmnxbl0lr8" path="res://main_menu.gd" id="1_menu"]
 [ext_resource type="Texture2D" uid="uid://c4g0pyla7kbf4" path="res://Assets/Title.png" id="2_7vrkn"]
 [ext_resource type="Shader" uid="uid://blejbf7o4wf0p" path="res://menu_background.gdshader" id="3_bgshader"]
-[ext_resource type="Texture2D" uid="uid://dmd52wbgbm5kq" path="res://Assets/Play.png" id="4_play"]
 
 [sub_resource type="ShaderMaterial" id="ShaderMaterial_bg"]
 shader = ExtResource("3_bgshader")
@@ -22,6 +21,8 @@ shader_parameter/swirl_speed = 1.0
 shader_parameter/spin_amount = 0.25
 shader_parameter/contrast = 3.5
 shader_parameter/lighting = 0.4
+
+[sub_resource type="CompressedTexture2D" id="CompressedTexture2D_fu7sn"]
 
 [node name="MainMenu" type="Control" unique_id=1861474867]
 layout_mode = 3
@@ -80,6 +81,6 @@ anchor_bottom = 1.0
 grow_horizontal = 2
 grow_vertical = 2
 mouse_filter = 2
-texture = ExtResource("4_play")
+texture = SubResource("CompressedTexture2D_fu7sn")
 expand_mode = 1
 stretch_mode = 5

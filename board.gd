@@ -54,6 +54,8 @@ const RESET_ANIM_TIME := 0.45
 const AI_THINK_DELAY := 0.2
 const MENU_FADE_TIME := 0.35
 const TOAST_TIME := 2.2
+const CAPTURE_POPUP_TIME := 1.35
+const CAPTURE_POINTS_MULTIPLIER := 100
 
 # --- Defeat sequence 
 const DEFEAT_SHAKE_TIME := 0.55
@@ -115,6 +117,10 @@ var _round_settled := false
 var _last_reward: Dictionary = {}
 var _toast_text := ""
 var _toast_timer := 0.0
+var _capture_points := {ChessEngine.WHITE: 0, ChessEngine.BLACK: 0}
+var _capture_popup_text := ""
+var _capture_popup_square := Vector2i(-1, -1)
+var _capture_popup_timer := 0.0
 
 # --- Animations 
 var _move_anim := Anim.new()
@@ -312,6 +318,7 @@ func _draw() -> void:
 	_draw_highlights()
 	_draw_coordinates(origin)
 	_draw_pieces()
+	_draw_capture_popup()
 	_draw_title()
 	_draw_hud()
 
@@ -424,11 +431,16 @@ func _draw_hud() -> void:
 
 	draw_string(font, Vector2(x, y), _mode_label(), HORIZONTAL_ALIGNMENT_LEFT, -1, 18, TEXT_DIM)
 	draw_string(font, Vector2(x, y + 38), _status_line(), HORIZONTAL_ALIGNMENT_LEFT, -1, 30, ACCENT)
+	# A persistent, high-contrast capture scoreboard. Standard piece values are
+	# multiplied by 100 so every capture feels like a meaningful score event.
+	draw_string_outline(font, Vector2(x, y + 76.0), "CAPTURE SCORE", HORIZONTAL_ALIGNMENT_LEFT, -1, 16, 3, GOLD)
+	draw_string_outline(font, Vector2(x, y + 105.0), "W  %06d" % int(_capture_points[ChessEngine.WHITE]), HORIZONTAL_ALIGNMENT_LEFT, -1, 24, 3, TEXT)
+	draw_string_outline(font, Vector2(x + 150.0, y + 105.0), "B  %06d" % int(_capture_points[ChessEngine.BLACK]), HORIZONTAL_ALIGNMENT_LEFT, -1, 24, 3, ACCENT)
 	if _is_local():
-		_draw_run_info(x, y + 92.0, _players[0], "Player 1 (%s)" % _color_name(_p1_color))
-		_draw_run_info(x + 230.0, y + 92.0, _players[1], "Player 2 (%s)" % _color_name(-_p1_color))
+		_draw_run_info(x, y + 170.0, _players[0], "Player 1 (%s)" % _color_name(_p1_color))
+		_draw_run_info(x + 230.0, y + 170.0, _players[1], "Player 2 (%s)" % _color_name(-_p1_color))
 	else:
-		_draw_run_info(x, y + 92.0, run)
+		_draw_run_info(x, y + 170.0, run)
 
 	if _toast_timer > 0.0:
 		var color := Color(GOLD, clampf(_toast_timer, 0.0, 1.0))
@@ -504,6 +516,9 @@ func _process(delta: float) -> void:
 
 	if _toast_timer > 0.0:
 		_toast_timer = maxf(_toast_timer - delta, 0.0)
+		animating = true
+	if _capture_popup_timer > 0.0:
+		_capture_popup_timer = maxf(_capture_popup_timer - delta, 0.0)
 		animating = true
 
 	if _shake_anim.is_active():
@@ -652,6 +667,8 @@ func _new_run() -> void:
 		_score = [0, 0]
 	else:
 		run = RunState.new()
+	_capture_points = {ChessEngine.WHITE: 0, ChessEngine.BLACK: 0}
+	_capture_popup_timer = 0.0
 	_start_round()
 
 
@@ -764,7 +781,13 @@ func _reset_view_state() -> void:
 
 
 func _make_move(from: Vector2i, to: Vector2i) -> void:
+	var mover_color: int = engine.turn
 	var castling := engine.is_castling(from, to)   # must be asked before the move is played
+	var en_passant := engine.is_en_passant(from, to)
+	var captured_square := Vector2i(to.x, from.y) if en_passant else to
+	var captured_code: int = engine.piece_at(captured_square)
+	if captured_code != ChessEngine.Type.EMPTY:
+		_register_capture(mover_color, captured_code, captured_square)
 	engine.make_move(from, to)
 	_move_from = from
 	_move_to = to
@@ -780,6 +803,55 @@ func _make_move(from: Vector2i, to: Vector2i) -> void:
 	_click_anim.stop()
 	_refresh_status()
 	_check_game_state()
+
+
+func _piece_points(code: int) -> int:
+	match absi(code):
+		ChessEngine.Type.PAWN:
+			return 1
+		ChessEngine.Type.KNIGHT, ChessEngine.Type.BISHOP:
+			return 3
+		ChessEngine.Type.ROOK:
+			return 5
+		ChessEngine.Type.QUEEN:
+			return 9
+		_:
+			return 0
+
+
+func _piece_label(code: int) -> String:
+	match absi(code):
+		ChessEngine.Type.PAWN: return "PAWN"
+		ChessEngine.Type.KNIGHT: return "KNIGHT"
+		ChessEngine.Type.BISHOP: return "BISHOP"
+		ChessEngine.Type.ROOK: return "ROOK"
+		ChessEngine.Type.QUEEN: return "QUEEN"
+		ChessEngine.Type.KING: return "KING"
+		_: return "PIECE"
+
+
+func _register_capture(mover_color: int, captured_code: int, square: Vector2i) -> void:
+	var points := _piece_points(captured_code) * CAPTURE_POINTS_MULTIPLIER
+	_capture_points[mover_color] = int(_capture_points.get(mover_color, 0)) + points
+	_capture_popup_square = square
+	_capture_popup_text = "+%d  %s!" % [points, _piece_label(captured_code)]
+	_capture_popup_timer = CAPTURE_POPUP_TIME
+	_toast("%s captured — +%d POINTS!" % [_piece_label(captured_code).capitalize(), points])
+	queue_redraw()
+
+
+func _draw_capture_popup() -> void:
+	if _capture_popup_timer <= 0.0 or _capture_popup_square == Vector2i(-1, -1):
+		return
+	var progress := 1.0 - _capture_popup_timer / CAPTURE_POPUP_TIME
+	var eased := 1.0 - pow(1.0 - progress, 3.0)
+	var center := _square_center(_capture_popup_square) + Vector2(0.0, -22.0 - eased * 52.0)
+	var pulse := 1.0 + 0.22 * sin(progress * PI)
+	var size := int(30.0 * pulse)
+	var alpha := clampf(minf(progress * 8.0, (1.0 - progress) * 3.0), 0.0, 1.0)
+	var label_width := font.get_string_size(_capture_popup_text, HORIZONTAL_ALIGNMENT_LEFT, -1, size).x
+	var pos := Vector2(center.x - label_width / 2.0, center.y)
+	draw_string_outline(font, pos, _capture_popup_text, HORIZONTAL_ALIGNMENT_LEFT, -1, size, 5, Color(GOLD.r, GOLD.g, GOLD.b, alpha))
 
 
 ## ONLINE: the opponent's move arrived. Never trust the network: re-check legality.
@@ -1149,9 +1221,8 @@ func _leave_to_menu() -> void:
 	get_tree().change_scene_to_file(MAIN_MENU_SCENE_PATH)
 
 
-# =============================================================================
+
 # Game-over menus
-# =============================================================================
 
 func _show_win_menu() -> void:
 	var vbox := _open_game_over_menu("Checkmate!", "You defeated the opponent.")
